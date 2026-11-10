@@ -1,0 +1,34 @@
+# Example DSL for the bundled, fictional local mock reporting platform.
+# Variables: {{task.*}}, {{env.*}}, {{var.*}}, {{run.id}}.
+name: quarterly-report
+version: 1
+steps:
+  - {action: open, url: "{{env.FILLBOT_BASE_URL}}/login"}
+  - {action: assert_status, status: 200}
+  - {action: fill, label: "账号", value: "{{task.username}}"}
+  - {action: fill, label: "口令", value: "{{task.password}}", timeout: 5}
+  - {action: click, selector: "form#login-form button[type=submit]"}
+  - {action: assert_status, status: 200}
+  - {action: assert_text, text: "第一步：企业基本信息"}
+  - {action: fill, selector: "#company_name", value: "{{task.company_name}}"}
+  - {action: fill, selector: "#contact_name", value: "{{task.contact_name}}"}
+  - {action: fill, selector: "#report_date", value: "{{task.report_date}}"}
+  - {action: click, selector: "form#step1-form button[type=submit]"}
+  - {action: assert_text, text: "第二步：能耗数据"}
+  - {action: fill, label: "用电量（千瓦时）", value: "{{task.electricity}}"}
+  - {action: fill, label: "用水量（吨）", value: "{{task.water}}"}
+  - {action: fill, label: "用气量（立方米）", value: "{{task.gas}}"}
+  - {action: click, selector: "form#step2-form button[type=submit]"}
+  - {action: assert_text, text: "第三步：用工与附件"}
+  - {action: fill, label: "期末从业人数", value: "{{task.employees}}"}
+  - {action: fill, label: "本季新增人数", value: "{{task.hires}}"}
+  - {action: upload, selector: "#attachment", path: "{{task.attachment}}"}
+  - {action: check, label: "我确认以上数据真实", checked: true}
+  - {action: click, selector: "form#step3-form button[type=submit]"}
+  - {action: assert_text, text: "请确认报送内容"}
+  - {action: extract, selector: "#review-period", save_as: reviewed_period}
+  - {action: set_var, name: dry_run_note, value: "reviewed {{var.reviewed_period}}"}
+  - {action: click, selector: "form#confirm-form button[type=submit]", final: true, retry: {attempts: 3, base_seconds: 0.05}}
+  - {action: assert_status, status: 200}
+  - {action: assert_text, text: "报送回执"}
+  - {action: extract, selector: "#receipt-no", save_as: receipt_no}

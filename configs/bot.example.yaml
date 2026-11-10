@@ -1,0 +1,19 @@
+# fillbot engine configuration (examples only; no secrets belong here).
+base_url: http://127.0.0.1:5000
+timeout_seconds: 10
+follow_redirects: true
+max_retries: 2
+backoff_base_seconds: 0.4
+backoff_max_seconds: 8.0
+jitter: true
+rate_limit_per_minute: 60
+evidence_keep_runs: 10
+evidence_dir: evidence
+ledger_path: data/ledger.db
+runs_dir: runs
+mask_fields:
+  - password
+  - passwd
+  - secret
+  - token
+  - csrf_token

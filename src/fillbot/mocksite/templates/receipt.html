@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>报送回执</h1>
+<p>本次季度数据报送已受理，请留存回执编号。</p>
+<p>回执编号：<span id="receipt-no" class="receipt">{{ receipt.receipt_no }}</span></p>
+<table>
+<tr><th>企业编号</th><td>{{ receipt.company_id }}</td></tr>
+<tr><th>报送季度</th><td>{{ receipt.period }}</td></tr>
+<tr><th>受理时间</th><td>{{ receipt.submitted_at }}</td></tr>
+</table>
+<p class="muted">本回执由虚构的本地 mock 站点生成，不具备任何真实法律效力。</p>
+{% endblock %}

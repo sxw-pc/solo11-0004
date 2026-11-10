@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} - 虚构报送平台{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
+<div class="error"><ul>{% for message in messages %}<li>{{ message }}</li>{% endfor %}</ul></div>
+<p><a href="/">返回首页</a></p>
+{% endblock %}

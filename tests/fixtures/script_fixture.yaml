@@ -1,0 +1,17 @@
+name: fixture-script
+version: 1
+steps:
+  - action: open
+    url: "{{env.FILLBOT_BASE_URL}}/login"
+  - action: assert_status
+    status: 200
+  - action: fill
+    label: "账号"
+    value: "{{task.username}}"
+  - action: fill
+    label: "口令"
+    value: "{{task.password}}"
+  - action: click
+    selector: "form#login-form button[type=submit]"
+  - action: assert_text
+    text: "第一步：企业基本信息"

@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>第三步：用工与附件</h1>
+{% if errors %}<div class="error"><ul>{% for field, items in errors.items() %}{% for item in items %}<li>{{ field }}: {{ item }}</li>{% endfor %}{% endfor %}</ul></div>{% endif %}
+<form id="step3-form" method="post" action="/report/step3" enctype="multipart/form-data">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<label for="employees">期末从业人数</label><input id="employees" name="employees" type="number" step="1" value="{{ values.employees }}" required>
+<label for="hires">本季新增人数</label><input id="hires" name="hires" type="number" step="1" value="{{ values.hires }}" required>
+<label for="attachment">附件（PDF/PNG，≤64 KiB）</label><input id="attachment" name="attachment" type="file" accept=".pdf,.png" required>
+<label for="confirmed"><input id="confirmed" name="confirmed" type="checkbox" value="on">我确认以上数据真实</label>
+<button type="submit">下一步</button>
+</form>
+{% endblock %}

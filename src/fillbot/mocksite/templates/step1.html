@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>第一步：企业基本信息</h1>
+{% if errors %}<div class="error"><ul>{% for field, items in errors.items() %}{% for item in items %}<li>{{ field }}: {{ item }}</li>{% endfor %}{% endfor %}</ul></div>{% endif %}
+<form id="step1-form" method="post" action="/report/step1">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<input type="hidden" name="company_id" value="{{ values.company_id }}">
+<p class="muted">企业编号：{{ values.company_id }}</p>
+<label for="company_name">企业名称</label><input id="company_name" name="company_name" value="{{ values.company_name }}" required>
+<label for="period">报送季度</label><input id="period" name="period" value="{{ values.period }}" placeholder="2025-Q4" required>
+<label for="contact_name">联系人</label><input id="contact_name" name="contact_name" value="{{ values.contact_name }}" required>
+<label for="report_date">报送日期</label><input id="report_date" name="report_date" type="date" value="{{ values.report_date }}" required>
+<button type="submit">下一步</button>
+</form>
+{% endblock %}

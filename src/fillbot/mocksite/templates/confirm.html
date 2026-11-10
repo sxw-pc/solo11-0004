@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>请确认报送内容</h1>
+<p class="muted">提交后本季度数据将进入报送台账，请核对以下信息。</p>
+<table>
+<tr><th>企业</th><td>{{ report.step1.company_name }}（{{ report.step1.company_id }}）</td></tr>
+<tr><th>季度</th><td><span id="review-period">{{ report.step1.period }}</span></td></tr>
+<tr><th>联系人</th><td>{{ report.step1.contact_name }}</td></tr>
+<tr><th>用电量</th><td>{{ report.step2.electricity }} 千瓦时</td></tr>
+<tr><th>用水量</th><td>{{ report.step2.water }} 吨</td></tr>
+<tr><th>用气量</th><td>{{ report.step2.gas }} 立方米</td></tr>
+<tr><th>从业人数</th><td>{{ report.step3.employees }}</td></tr>
+<tr><th>新增人数</th><td>{{ report.step3.hires }}</td></tr>
+<tr><th>附件</th><td>{{ report.step3.attachment_name }}（{{ report.step3.attachment_size }} 字节）</td></tr>
+</table>
+<form id="confirm-form" method="post" action="/report/submit">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<input type="hidden" name="company_id" value="{{ report.step1.company_id }}">
+<button type="submit">确认并提交</button>
+</form>
+{% endblock %}

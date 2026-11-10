@@ -1,0 +1,3 @@
+task_id,biz_key,attachments,username,password,company_id,company_name,period,contact_name,report_date,electricity,water,gas,employees,hires
+T-9002,C003:2025-Q4,attachment.pdf,parkco-c,mock-only-gamma,C003,溪谷智造工坊（虚构）,2025-Q4,顾青（虚构）,2025-11-10,4520,88,12.5,18,1
+T-9003,C002:2025-Q2,attachment.pdf,parkco-b,mock-only-beta,C002,青岚谷生态科技（虚构）,2025-Q2,周明（虚构）,2025-07-31,9000,201,70,40,2

@@ -1,0 +1,21 @@
+[
+  {
+    "task_id": "BAD ID",
+    "biz_key": "C002-2025-Q4",
+    "attachments": ["missing.pdf"],
+    "payload": {
+      "username": "UPPER",
+      "password": "short",
+      "company_id": "C099",
+      "company_name": "",
+      "period": "2025-Q9",
+      "contact_name": "X",
+      "report_date": "2025-13-40",
+      "electricity": "not-a-number",
+      "water": -1,
+      "gas": 88,
+      "employees": 1.5,
+      "hires": 99999
+    }
+  }
+]

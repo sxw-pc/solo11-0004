@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>账号登录</h1>
+<p class="muted">演示账号见 README，口令仅为 mock-only- 前缀的虚构值。</p>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+<form id="login-form" method="post" action="/login">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<label for="username">账号</label><input id="username" name="username" autocomplete="username" required>
+<label for="password">口令</label><input id="password" name="password" type="password" autocomplete="current-password" required>
+<button type="submit">登录</button>
+</form>
+{% endblock %}

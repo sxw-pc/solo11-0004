@@ -1,0 +1,5 @@
+{
+  "pattern": "^RCP-\\d{8}-\\d{4}$",
+  "example": "RCP-20250115-0001",
+  "note": "Fictional receipt format used by the local mock site."
+}

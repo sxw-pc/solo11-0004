@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fillbot"
+version = "0.1.0"
+description = "Fillbot - a compliant, offline-first form-filling RPA robot"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "fillbot contributors"}]
+dependencies = [
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+    "Flask>=3.0,<4",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[project.scripts]
+fillbot = "fillbot.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+fillbot = ["mocksite/templates/*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=fillbot --cov-report=term-missing --cov-fail-under=85"
+markers = ["slow: slower integration tests"]
+
+[tool.coverage.run]
+source = ["fillbot"]
+branch = false
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+]
