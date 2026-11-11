@@ -42,6 +42,10 @@ src/fillbot/mocksite/templates/receipt.html
 src/fillbot/mocksite/templates/step1.html
 src/fillbot/mocksite/templates/step2.html
 src/fillbot/mocksite/templates/step3.html
+src/fillbot/precheck/__init__.py
+src/fillbot/precheck/checks.py
+src/fillbot/precheck/engine.py
+src/fillbot/precheck/ruleset.py
 src/fillbot/runner/__init__.py
 src/fillbot/runner/pacing.py
 src/fillbot/runner/retry.py
@@ -56,3 +60,4 @@ tests/test_intake.py
 tests/test_ledger_retry_state.py
 tests/test_mechanical.py
 tests/test_mocksite.py
+tests/test_precheck.py

@@ -21,12 +21,14 @@ pip install -e ".[dev]"
 pytest                                               # 离线；覆盖率门槛 85%
 python -m fillbot mock-serve                         # http://127.0.0.1:5000
 python -m fillbot validate --tasks tasks/example_batch.json --script scripts/quarterly_report.yaml
+python -m fillbot precheck --tasks tasks/example_batch.json --rules configs/precheck.example.yaml
 python -m fillbot run --tasks tasks/example_batch.json --script scripts/quarterly_report.yaml
+python -m fillbot run --tasks tasks/example_batch.json --script scripts/quarterly_report.yaml --precheck configs/precheck.example.yaml
 python -m fillbot run --tasks tasks/example_batch.json --script scripts/quarterly_report.yaml --dry-run
 python -m fillbot resume <run_id> --config configs/bot.example.yaml
 python -m fillbot report <run_id> --config configs/bot.example.yaml
 ```
-`validate` 完全离线，仅检查任务与脚本；`run` 默认串行执行。mock 账号（虚构）：`parkco-b / mock-only-beta`（C002，正常）、`parkco-c / mock-only-gamma`（C003，可注入提交故障）。
+`validate` 完全离线，仅检查任务与脚本；`precheck` 完全离线，仅做跨字段业务规则预检；`run` 默认串行执行。mock 账号（虚构）：`parkco-b / mock-only-beta`（C002，正常）、`parkco-c / mock-only-gamma`（C003，可注入提交故障）。
 ## 架构
 ```text
 tasks (JSON/CSV) ──> intake loader ──> validator (row + field diagnostics)
@@ -44,6 +46,7 @@ scripts (YAML) ──> DSL schema ──> DSL engine ──> MechanicalBrowser (
 src/fillbot/browser/     requests+BeautifulSoup 适配器、页面模型、脱敏
 src/fillbot/dsl/         脚本 schema、动作实现、选择器、执行引擎
 src/fillbot/intake/      JSON/CSV 载入、字段规范化与聚合校验
+src/fillbot/precheck/    跨字段业务规则预检（YAML 规则集、动态参数、聚合报告）
 src/fillbot/runner/      串行调度、重试、状态机、限速、续跑
 src/fillbot/ledger/      SQLite 台账与汇总报表
 src/fillbot/evidence/    证据目录、HTML 脱敏、保留策略
@@ -63,6 +66,27 @@ task_id,biz_key,attachments,company_id,period
 T-9002,C002:2025-Q1,attachments/quarterly-notes.pdf,C002,2025-Q1
 ```
 校验失败会一次性聚合所有问题，输出 `文件:row N [field] message`，便于逐行修正。
+## 前置预检（跨字段业务规则）
+字段格式校验之外，`precheck` 子命令在触发填报前对全量任务做**跨字段业务规则**预检：完全离线、不发起任何网络请求，所有违规一次性聚合输出（不遇首个错误即停），每条问题都关联 `task_id` 与 `biz_key` 便于定位。规则用 YAML 配置（示例见 `configs/precheck.example.yaml`），与现有配置风格一致。
+```bash
+python -m fillbot precheck --tasks tasks/example_batch.json --rules configs/precheck.example.yaml
+python -m fillbot precheck --tasks tasks/example_batch.json --rules configs/precheck.example.yaml \
+    --param max_electricity=30000 --json
+```
+退出码：`0` 全部通过；`1` 存在违规（任务未通过预检）；`2` 用法/配置错误（规则文件语法错误会指明文件位置与行列号）。`--json` 输出机读报告（含每条违规的 task_id、biz_key、rule_id、rule_type、message）。
+规则集结构：`name`（必填）、`version: 1`、`params`（动态参数默认值，可被 `--param name=value` 覆盖，值按 YAML 解析；规则内用 `{{params.名}}` 引用，整串引用保留类型）、`rules`（非空列表，每条含唯一 `id`、`type` 与类型专属键，可选 `message` 自定义文案）。未知键、未知类型、未定义参数一律报错并定位到具体规则。
+内置 7 类跨字段规则：
+| 类型 | 关键配置 | 说明 |
+| --- | --- | --- |
+| `numeric_threshold` | `field`、`min`/`max` | 数值阈值（上下限可用参数） |
+| `field_relation` | `left`、`op`、`right_field` 或 `right_value` | 字段间数值关系（如 `hires <= employees`） |
+| `logical_association` | `when`、`then` | 条件成立时要求字段必填或满足期望（如人数>100 则必填电话） |
+| `period_match` | `period_field`、`date_field`、`biz_key_suffix`、`allowed`、`not_before`/`not_after` | 周期匹配：报送日期落在季度内、biz_key 后缀一致、周期在允许范围 |
+| `value_mapping` | `field`、`map`、`on_unmapped` | 取值映射：某字段取值决定其他字段的允许值（如企业→账号） |
+| `aggregate_sum` | `fields`、`min`/`max` | 多字段合计阈值（如能耗总量上限） |
+| `batch_unique` | `fields` | 批次级组合唯一（如 企业+季度 不重复） |
+`when`/`then` 条件支持 `== != > >= < <= in not_in matches blank not_blank`。
+与填报链路的关系：`run --precheck rules.yaml` 会在加载任务后、创建运行前执行同一套预检，**预检不通过的任务默认被拦截、不进入填报环节**（全部被拦截则本次不启动）；加 `--precheck-warn-only` 可降级为仅告警。预检是独立前置模块，不改动填报执行核心链路；不带 `--precheck` 的 `run` 行为与之前完全一致。千条量级任务全量预检耗时在秒级以内（测试断言 < 3 秒）。
 ## DSL 参考
 顶层字段：`name`（必填）、`version: 1`、`steps`（非空列表）。每个步骤是映射，支持 `selector` 或 `label` 二选一作为定位器；公共选项：`timeout`（秒，>0）、`retry`（整数或 `{attempts, base_seconds, max_seconds}`）、`on_error`（`fail|skip|continue`）、`final`（仅 `click` 可用，标记提交步骤）。
 | 动作 | 参数 | 说明 |

@@ -1,0 +1,66 @@
+# Example precheck ruleset: cross-field business rules evaluated fully offline
+# before any filling run. Params below are batch defaults; override any of them
+# per batch with `--param name=value` (values are parsed as YAML scalars).
+name: quarterly-precheck
+version: 1
+params:
+  max_electricity: 50000        # kWh cap for a single task in this batch
+  max_total_energy: 60000       # cap on electricity+water+gas per task
+  allowed_periods: ["2025-Q3", "2025-Q4"]
+rules:
+  # 1. numeric_threshold: one numeric field against static or param-driven bounds.
+  - id: electricity-cap
+    type: numeric_threshold
+    field: electricity
+    max: "{{params.max_electricity}}"
+    message: 用电量超过本批次上限
+
+  # 2. field_relation: numeric relation between two fields (or a field and a constant).
+  - id: hires-within-employees
+    type: field_relation
+    left: hires
+    op: "<="
+    right_field: employees
+    message: 新增人数不能超过期末从业人数
+
+  # 3. logical_association: when a condition holds, requirements must be met.
+  - id: large-employer-needs-phone
+    type: logical_association
+    when: {field: employees, op: ">", value: 100}
+    then:
+      - {require: contact_phone}
+    message: 从业人数超过100人时必须填写联系电话
+  - id: zero-employees-zero-hires
+    type: logical_association
+    when: {field: employees, op: "==", value: 0}
+    then:
+      - {field: hires, op: "==", value: 0}
+
+  # 4. period_match: quarter consistency across period, report_date and biz_key.
+  - id: period-consistency
+    type: period_match
+    period_field: period
+    date_field: report_date      # report_date must fall inside the declared quarter
+    biz_key_suffix: true         # biz_key must end with ":<period>"
+    allowed: "{{params.allowed_periods}}"
+
+  # 5. value_mapping: the value of one field constrains allowed values of others.
+  - id: company-account-mapping
+    type: value_mapping
+    field: company_id
+    map:
+      C001: {username: [parkco-a]}
+      C002: {username: [parkco-b]}
+      C003: {username: [parkco-c]}
+    on_unmapped: error           # unknown company_id is a violation (use "ignore" to skip)
+
+  # 6. aggregate_sum: the sum of several numeric fields against bounds.
+  - id: total-energy-cap
+    type: aggregate_sum
+    fields: [electricity, water, gas]
+    max: "{{params.max_total_energy}}"
+
+  # 7. batch_unique: a field combination must be unique across the whole batch.
+  - id: company-period-unique
+    type: batch_unique
+    fields: [company_id, period]
