@@ -15,6 +15,7 @@ _DEFAULTS: dict[str, Any] = {
     "backoff_max_seconds": 8.0,
     "jitter": True,
     "rate_limit_per_minute": 60,
+    "max_concurrency": 1,
     "evidence_keep_runs": 10,
     "evidence_dir": "evidence",
     "ledger_path": "data/ledger.db",
@@ -30,6 +31,7 @@ _ENV_MAP = {
     "FILLBOT_BACKOFF_MAX_SECONDS": "backoff_max_seconds",
     "FILLBOT_JITTER": "jitter",
     "FILLBOT_RATE_LIMIT_PER_MINUTE": "rate_limit_per_minute",
+    "FILLBOT_MAX_CONCURRENCY": "max_concurrency",
     "FILLBOT_EVIDENCE_KEEP_RUNS": "evidence_keep_runs",
     "FILLBOT_EVIDENCE_DIR": "evidence_dir",
     "FILLBOT_LEDGER_PATH": "ledger_path",
@@ -57,8 +59,8 @@ def _num(value: Any, name: str, cast: type, minimum: float) -> float | int:
 def _coerce(key: str, value: Any) -> Any:
     if key in {"timeout_seconds", "backoff_base_seconds", "backoff_max_seconds"}:
         return _num(value, key, float, 0.01)
-    if key in {"max_retries", "evidence_keep_runs"}:
-        return _num(value, key, int, 0)
+    if key in {"max_retries", "evidence_keep_runs", "max_concurrency"}:
+        return _num(value, key, int, 1)
     if key == "rate_limit_per_minute":
         return _num(value, key, int, 1)
     if key in {"follow_redirects", "jitter"}:
@@ -85,6 +87,7 @@ class BotConfig:
     backoff_max_seconds: float = 8.0
     jitter: bool = True
     rate_limit_per_minute: int = 60
+    max_concurrency: int = 1
     evidence_keep_runs: int = 10
     evidence_dir: Path = field(default_factory=lambda: Path("evidence"))
     ledger_path: Path = field(default_factory=lambda: Path("data/ledger.db"))

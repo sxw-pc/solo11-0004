@@ -7,6 +7,8 @@ backoff_base_seconds: 0.4
 backoff_max_seconds: 8.0
 jitter: true
 rate_limit_per_minute: 60
+# 单批次内最大并发任务数；1 表示完全串行（默认，兼容旧行为）。
+max_concurrency: 1
 evidence_keep_runs: 10
 evidence_dir: evidence
 ledger_path: data/ledger.db

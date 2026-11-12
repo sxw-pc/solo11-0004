@@ -1,5 +1,6 @@
 """Fictional accounts, one pre-existing submission and the in-memory store."""
 from __future__ import annotations
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -51,16 +52,41 @@ class MockStore:
             Submission("C001", "2025-Q3", "RCP-20250115-0001", "2025-01-15T09:30:00+00:00", {"seeded": True})
         ]
         self._receipt_seq = 2
+        # The mock runs a threaded Flask server; serialise receipt issuance so
+        # concurrent workers cannot observe the same sequence number. RLock
+        # because add_submission re-enters via find_submission.
+        self._lock = threading.RLock()
+
     def authenticate(self, username: str, password: str) -> Account | None:
         account = self.accounts.get(username)
         return account if account is not None and account.password == password else None
     def find_submission(self, company_id: str, period: str) -> Submission | None:
-        return next(
-            (item for item in self.submissions if item.company_id == company_id and item.period == period), None
-        )
+        with self._lock:
+            return next(
+                (item for item in self.submissions if item.company_id == company_id and item.period == period), None
+            )
+    def find_receipt(self, receipt_no: str) -> Submission | None:
+        with self._lock:
+            return next((item for item in self.submissions if item.receipt_no == receipt_no), None)
     def add_submission(self, company_id: str, period: str, payload: dict[str, Any]) -> Submission:
-        if self.find_submission(company_id, period) is not None:
-            raise ValueError("duplicate submission")
+        with self._lock:
+            if self.find_submission(company_id, period) is not None:
+                raise ValueError("duplicate submission")
+            return self._append_submission(company_id, period, payload)
+
+    def submit_if_absent(self, company_id: str, period: str, payload: dict[str, Any]) -> Submission | None:
+        """Atomically add a submission only when none exists for the key.
+
+        Returns the new submission, or ``None`` when the company/period pair
+        was already submitted. The check and insert share one lock so
+        concurrent requests cannot both pass the duplicate guard.
+        """
+        with self._lock:
+            if self.find_submission(company_id, period) is not None:
+                return None
+            return self._append_submission(company_id, period, payload)
+
+    def _append_submission(self, company_id: str, period: str, payload: dict[str, Any]) -> Submission:
         now = self.clock()
         stamp = now.strftime("%Y%m%d")
         receipt = f"RCP-{stamp}-{self._receipt_seq:04d}"
@@ -71,5 +97,11 @@ class MockStore:
         submission = Submission(company_id, period, receipt, now.isoformat(), dict(payload))
         self.submissions.append(submission)
         return submission
+
     def receipts(self) -> list[str]:
-        return [item.receipt_no for item in self.submissions]
+        with self._lock:
+            return [item.receipt_no for item in self.submissions]
+
+    def submission_count(self) -> int:
+        with self._lock:
+            return len(self.submissions)

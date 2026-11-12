@@ -1,7 +1,14 @@
-"""Per-step HTML snapshots, action journals and retention cleanup."""
+"""Per-step HTML snapshots, action journals and retention cleanup.
+
+Each task owns a dedicated subdirectory (``<run>/<task_id>/``), so workers
+writing different tasks never touch the same files. A small lock guards the
+shared operations that can still race (directory creation, journal append
+and retention cleanup).
+"""
 from __future__ import annotations
 import json
 import shutil
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -19,13 +26,18 @@ class EvidenceStore:
         self.base_dir = Path(base_dir)
         self.mask_fields = tuple(mask_fields)
         self.keep_runs = max(0, keep_runs)
+        self._lock = threading.Lock()
+
     def run_dir(self, run_id: str) -> Path:
         path = self.base_dir / safe_component(run_id)
-        path.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            path.mkdir(parents=True, exist_ok=True)
         return path
+
     def task_dir(self, run_id: str, task_id: str) -> Path:
         path = self.run_dir(run_id) / safe_component(task_id)
-        path.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            path.mkdir(parents=True, exist_ok=True)
         return path
     def snapshot(
         self,
@@ -46,17 +58,21 @@ class EvidenceStore:
         path = self.task_dir(run_id, task_id) / "actions.jsonl"
         payload = dict(record)
         payload.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        line = json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
+        # Serialise appends so concurrent steps cannot interleave JSON lines.
+        with self._lock, path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
         return path
+
     def cleanup(self, keep: int | None = None) -> list[str]:
         retain = self.keep_runs if keep is None else max(0, keep)
-        if not self.base_dir.is_dir():
-            return []
-        candidates = [item for item in self.base_dir.iterdir() if item.is_dir()]
-        candidates.sort(key=lambda item: item.stat().st_mtime, reverse=True)
-        removed = []
-        for directory in candidates[retain:]:
-            shutil.rmtree(directory, ignore_errors=True)
-            removed.append(directory.name)
-        return removed
+        with self._lock:
+            if not self.base_dir.is_dir():
+                return []
+            candidates = [item for item in self.base_dir.iterdir() if item.is_dir()]
+            candidates.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+            removed = []
+            for directory in candidates[retain:]:
+                shutil.rmtree(directory, ignore_errors=True)
+                removed.append(directory.name)
+            return removed

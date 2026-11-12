@@ -1,10 +1,20 @@
-"""Serial run orchestration with evidence, ledger, idempotency and resume."""
+"""Batch orchestration with evidence, ledger, idempotency and resume.
+
+Execution model: tasks within one batch may run concurrently up to the
+configured ``max_concurrency`` (default 1, which preserves the original
+serial behaviour exactly). Every worker gets its own browser session, so
+cookies/CSRF state never cross enterprise boundaries; the rate limiter,
+ledger and evidence store are shared and individually thread-safe.
+Idempotency, retry and resume semantics are identical to the serial path.
+"""
 from __future__ import annotations
 import logging
 import os
 import re
+import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Sequence
 from fillbot.browser.base import BrowserSession
 from fillbot.browser.mechanical import MechanicalBrowser
@@ -21,6 +31,32 @@ from fillbot.runner.retry import RetryPolicy
 from fillbot.runner.state import plan_resume
 RECEIPT_RE = re.compile(r"^RCP-\d{8}-\d{4}$")
 BrowserFactory = Callable[[], BrowserSession]
+
+
+class _BizKeyGate:
+    """Serialise tasks that share the same idempotency key.
+
+    Different ``biz_key`` values get independent locks, so unrelated
+    enterprises keep running fully in parallel. Tasks with the same key run
+    one at a time; while holding the key lock each task re-reads the durable
+    ledger state, so a task only skips when a *successful* record actually
+    exists. A failed predecessor therefore never suppresses a successor the
+    way a purely in-memory "claimed" flag would. A worker ever holds a single
+    key lock, so the locks cannot deadlock.
+    """
+
+    def __init__(self) -> None:
+        self._registry_lock = threading.Lock()
+        self._key_locks: dict[str, threading.Lock] = {}
+
+    def lock_for(self, biz_key: str) -> threading.Lock:
+        with self._registry_lock:
+            lock = self._key_locks.get(biz_key)
+            if lock is None:
+                lock = threading.Lock()
+                self._key_locks[biz_key] = lock
+            return lock
+
 class Runner:
     def __init__(
         self,
@@ -38,11 +74,15 @@ class Runner:
             config.evidence_dir, mask_fields=config.mask_fields, keep_runs=config.evidence_keep_runs
         )
         self.sleeper = sleeper
+        # One shared limiter for the whole run: the global rate holds under
+        # any concurrency level because token accounting is locked internally.
         self.limiter = RateLimiter(config.rate_limit_per_minute, sleeper=sleeper)
         self._browser_factory = browser_factory
         self._logger = logger
         self._file_handler: logging.FileHandler | None = None
     def _factory(self) -> BrowserSession:
+        # A fresh session per task guarantees cookie/CSRF isolation between
+        # different enterprises; sessions are never shared across threads.
         if self._browser_factory is not None:
             return self._browser_factory()
         return MechanicalBrowser(timeout=self.config.timeout_seconds, follow_redirects=self.config.follow_redirects, limiter=self.limiter.wait)
@@ -83,25 +123,26 @@ class Runner:
         self.ledger.start_task(run_id, task, started_at, evidence_dir)
         logger.info("task %s started biz_key=%s", task.task_id, task.biz_key)
         secrets, snapshots = self._secrets(task), {}
-        browser = self._factory()
-        env = {**os.environ, "FILLBOT_BASE_URL": self.config.base_url}
-        def snapshot_cb(step, page, status):
-            snapshots[step.index] = str(
-                self.evidence.snapshot(run_id, task.task_id, step.index, page, secret_values=secrets)
-            )
-        def action_cb(record):
-            self.evidence.append_action(run_id, task.task_id, record)
-        def retry_cb(step, attempt, error, delay):
-            logger.warning(
-                "task %s step %s action=%s retry=%s delay=%.3fs error=%s",
-                task.task_id,
-                step.index,
-                step.action,
-                attempt,
-                delay,
-                error.category.value,
-            )
+        browser: BrowserSession | None = None
         try:
+            browser = self._factory()
+            env = {**os.environ, "FILLBOT_BASE_URL": self.config.base_url}
+            def snapshot_cb(step, page, status):
+                snapshots[step.index] = str(
+                    self.evidence.snapshot(run_id, task.task_id, step.index, page, secret_values=secrets)
+                )
+            def action_cb(record):
+                self.evidence.append_action(run_id, task.task_id, record)
+            def retry_cb(step, attempt, error, delay):
+                logger.warning(
+                    "task %s step %s action=%s retry=%s delay=%.3fs error=%s",
+                    task.task_id,
+                    step.index,
+                    step.action,
+                    attempt,
+                    delay,
+                    error.category.value,
+                )
             executor = DSLExecutor(
                 script,
                 browser,
@@ -165,7 +206,23 @@ class Runner:
             logger.error("task %s crashed class=%s message=%s", task.task_id, error.category.value, error.message)
             return TaskStatus.FAILED, None, error.category.value, error.message, 1, evidence_dir, []
         finally:
-            browser.close()
+            if browser is not None:
+                browser.close()
+    def _idempotent_skip(self, run_id: str, task: TaskRecord, logger: logging.Logger) -> None:
+        evidence_dir = str(self.evidence.run_dir(run_id))
+        self.ledger.start_task(run_id, task, iso_now(), evidence_dir)
+        self.ledger.finish_task(run_id, task.task_id, status=TaskStatus.SKIPPED.value, finished_at=iso_now(), duration_ms=0, attempts=0, error_message="idempotent skip: biz_key already succeeded", receipt_no=None, evidence_dir=evidence_dir)
+        logger.info("task %s skipped idempotently", task.task_id)
+    def _dispatch(self, run_id: str, task: TaskRecord, script: Script, logger: logging.Logger, dry_run: bool, gate: _BizKeyGate) -> None:
+        # Hold the per-biz_key lock across the whole task so concurrent tasks
+        # sharing an idempotency key cannot both submit. The skip decision is
+        # made against the ledger while the lock is held, matching the serial
+        # runner's check-then-act ordering exactly.
+        with gate.lock_for(task.biz_key):
+            if self.ledger.has_successful_biz_key(task.biz_key):
+                self._idempotent_skip(run_id, task, logger)
+                return
+            self._execute_task(run_id, task, script, logger, dry_run)
     def _finalize(self, run: RunRecord, tasks: Sequence[TaskRecord], *, interrupted: bool = False) -> RunRecord:
         counts = Counter(str(row["status"]) for row in self.ledger.list_task_rows(run.run_id))
         run.tasks_total = len(tasks)
@@ -222,17 +279,44 @@ class Runner:
             logger.info("start run=%s tasks=%s dry_run=%s", rid, len(tasks), dry_run)
         try:
             completed = set(plan_resume(self.ledger, rid, tasks).completed_task_ids) if resume else set()
-            for task in tasks:
-                if task.task_id in completed:
-                    logger.info("task %s already complete; skipped on resume", task.task_id)
-                    continue
-                if self.ledger.has_successful_biz_key(task.biz_key):
-                    evidence_dir = str(self.evidence.run_dir(rid))
-                    self.ledger.start_task(rid, task, iso_now(), evidence_dir)
-                    self.ledger.finish_task(rid, task.task_id, status=TaskStatus.SKIPPED.value, finished_at=iso_now(), duration_ms=0, attempts=0, error_message="idempotent skip: biz_key already succeeded", receipt_no=None, evidence_dir=evidence_dir)
-                    logger.info("task %s skipped idempotently", task.task_id)
-                    continue
-                self._execute_task(rid, task, script, logger, dry_run)
+            pending = [task for task in tasks if task.task_id not in completed]
+            # Pre-register every task in batch order. Rows keep this rowid
+            # ordering for reports even when workers finish out of order.
+            for task in pending:
+                self.evidence.task_dir(rid, task.task_id)
+                self.ledger.register_task(rid, task, str(self.evidence.task_dir(rid, task.task_id)))
+            gate = _BizKeyGate()
+            workers = max(1, int(self.config.max_concurrency))
+            logger.info("dispatch run=%s tasks=%s concurrency=%s", rid, len(pending), workers)
+            if workers == 1:
+                # Serial path: identical control flow to the original runner,
+                # including immediate propagation of interruptions.
+                for task in pending:
+                    self._dispatch(rid, task, script, logger, dry_run, gate)
+            else:
+                pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"fillbot-{rid}")
+                try:
+                    futures = [
+                        pool.submit(self._dispatch, rid, task, script, logger, dry_run, gate)
+                        for task in pending
+                    ]
+                    for future in futures:
+                        # Ordinary task failures are already recorded as a
+                        # terminal status inside _execute_task. A BaseException
+                        # (e.g. SystemExit/KeyboardInterrupt) escapes the worker
+                        # and is re-raised here; the handler below cancels work
+                        # that never started while letting in-flight tasks
+                        # settle, then the outer handler marks the run
+                        # interrupted and keeps it resumable.
+                        future.result()
+                except BaseException:
+                    # cancel_futures drops only queued (not-yet-started) tasks;
+                    # wait=True still joins the tasks already in flight so their
+                    # ledger rows reach a terminal, auditable state.
+                    pool.shutdown(wait=True, cancel_futures=True)
+                    raise
+                else:
+                    pool.shutdown(wait=True)
             return self._finalize(run, tasks)
         except BaseException:
             self._finalize(run, tasks, interrupted=True)

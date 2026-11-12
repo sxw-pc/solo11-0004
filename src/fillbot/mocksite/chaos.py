@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os
 import random
+import threading
 import time
 from dataclasses import dataclass
 from typing import Mapping
@@ -44,24 +45,28 @@ class ChaosController:
         self.settings = settings
         self.rng = random.Random(settings.seed)
         self.flaky_fired = False
+        # The threaded mock server may invoke decide() concurrently.
+        self._lock = threading.Lock()
+
     def decide(self, method: str, path: str, company_id: str | None = None) -> ChaosDecision:
         if not self.settings.enabled or path.startswith(("/__mock", "/static")):
             return ChaosDecision()
-        delay = self.rng.randint(0, self.settings.delay_ms) / 1000.0 if self.settings.delay_ms else 0.0
-        company_match = not self.settings.flaky_company or self.settings.flaky_company == (company_id or "")
-        if (
-            self.settings.flaky_submit
-            and company_match
-            and not self.flaky_fired
-            and method.upper() == "POST"
-            and path == "/report/submit"
-        ):
-            self.flaky_fired = True
-            return ChaosDecision(status=500, delay_seconds=delay)
-        if self.settings.failure_rate > 0 and self.rng.random() < self.settings.failure_rate:
-            status = self.rng.choice((500, 429))
-            return ChaosDecision(status, self.settings.retry_after if status == 429 else None, delay)
-        return ChaosDecision(delay_seconds=delay)
+        with self._lock:
+            delay = self.rng.randint(0, self.settings.delay_ms) / 1000.0 if self.settings.delay_ms else 0.0
+            company_match = not self.settings.flaky_company or self.settings.flaky_company == (company_id or "")
+            if (
+                self.settings.flaky_submit
+                and company_match
+                and not self.flaky_fired
+                and method.upper() == "POST"
+                and path == "/report/submit"
+            ):
+                self.flaky_fired = True
+                return ChaosDecision(status=500, delay_seconds=delay)
+            if self.settings.failure_rate > 0 and self.rng.random() < self.settings.failure_rate:
+                status = self.rng.choice((500, 429))
+                return ChaosDecision(status, self.settings.retry_after if status == 429 else None, delay)
+            return ChaosDecision(delay_seconds=delay)
     def apply_delay(self, decision: ChaosDecision) -> None:
         if decision.delay_seconds > 0:
             time.sleep(decision.delay_seconds)

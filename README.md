@@ -97,7 +97,8 @@ steps:
 | `backoff_base_seconds` / `..._BASE_SECONDS` | 0.4 | 指数退避基数 |
 | `backoff_max_seconds` / `..._MAX_SECONDS` | 8.0 | 退避上限 |
 | `jitter` / `FILLBOT_JITTER` | true | 是否加抖动 |
-| `rate_limit_per_minute` / `..._RATE_LIMIT_PER_MINUTE` | 60 | 全局令牌桶速率 |
+| `rate_limit_per_minute` / `..._RATE_LIMIT_PER_MINUTE` | 60 | 全局令牌桶速率（所有并发线程共享） |
+| `max_concurrency` / `FILLBOT_MAX_CONCURRENCY` | 1 | 单批次内最大并发任务数；`1` 为完全串行，兼容旧行为，CLI 可用 `--concurrency` 覆盖 |
 | `follow_redirects` / `FILLBOT_FOLLOW_REDIRECTS` | true | 是否跟随重定向 |
 | `evidence_dir` / `FILLBOT_EVIDENCE_DIR` | `evidence` | 证据根目录 |
 | `evidence_keep_runs` / `FILLBOT_EVIDENCE_KEEP_RUNS` | 10 | 保留最近运行数 |
@@ -107,19 +108,19 @@ steps:
 ## 错误、重试与状态
 错误类别：`NETWORK`、`SERVER`（均含 429/5xx）、`CLIENT`（4xx）、`ASSERT`、`SCRIPT`。只有 NETWORK/SERVER 自动重试；`Retry-After` 优先，其次指数退避 + 抖动。任务状态：`pending → running → success|failed|skipped|dry_run`；运行状态：`running → success|failed|interrupted|dry_run`，`interrupted/failed` 可续跑。未捕获异常（含 Ctrl+C/SystemExit）会把运行标记为 `interrupted` 后继续抛出。
 ## 幂等、dry-run 与续跑
-- 幂等键为 `biz_key`：台账中已有成功记录时，新任务直接记 `skipped`，不发起提交。
-- 回执号必须匹配 `RCP-YYYYMMDD-NNNN` 且全局唯一（SQLite 部分唯一索引 + 运行时检查）。
-- `--dry-run` 真实执行并留存步骤证据，但遇到 `final: true` 的点击前停止，状态为 `dry_run`，不产生回执。
-- `resume <run_id>` 从台账读取原任务/脚本路径，跳过 `success|skipped`，只执行余下任务；已成功的 `biz_key` 不会重复提交。
+- 幂等键为 `biz_key`：台账中已有成功记录时，新任务直接记 `skipped`，不发起提交。并发批次内同一 `biz_key` 的任务由每键独立的锁串行化，并在持锁期间基于台账真实成功状态判定，因此只有一个真正执行、其余在确认已有成功记录后记 `skipped`；前驱任务失败不会错误抑制后继任务。不同 `biz_key` 之间仍完全并行。
+- 回执号必须匹配 `RCP-YYYYMMDD-NNNN` 且全局唯一（SQLite 部分唯一索引 + 运行时检查）；并发下重复回执的检查与写入在同一写事务内完成，消除检查与写入之间的竞态。
+- `--dry-run` 真实执行并留存步骤证据，但遇到 `final: true` 的点击前停止，状态为 `dry_run`，不产生回执；并发 dry-run 同样不产生任何提交。
+- `resume <run_id>` 从台账读取原任务/脚本路径，跳过 `success|skipped`，只执行余下任务；并发运行中断时，所有任务已按批次顺序预登记为 `pending`，续跑能识别全部未完成（含从未启动）的任务并恢复，已成功的 `biz_key` 不会重复提交。
 ## 证据与台账
-证据位于 `evidence/<run_id>/<task_id>/`：每步 `step-NN.html`（密码、token、secret 字段及已知敏感值替换为 `***`）、`actions.jsonl`（动作、定位器、结果、耗时、错误，不含填写值）、成功提交后的 `receipt.html`。证据快照会强制保存，便于审计后复核；保留策略只清理超期运行目录，不动台账。
-SQLite 三张表：`runs`（来源、状态、计数、时间）、`tasks`（任务、业务键、回执、错误、证据目录）、`steps`（步骤、动作、状态、尝试次数）。汇总写到 `runs/<run_id>/summary.json` 与 `summary.csv`，包含成功/失败/跳过数、失败原因分布、平均耗时与回执列表。
+证据位于 `evidence/<run_id>/<task_id>/`：每步 `step-NN.html`（密码、token、secret 字段及已知敏感值替换为 `***`）、`actions.jsonl`（动作、定位器、结果、耗时、错误，不含填写值）、成功提交后的 `receipt.html`。证据快照会强制保存，便于审计后复核；保留策略只清理超期运行目录，不动台账。每个任务独占子目录，并发任务之间不会覆盖或命名冲突，目录创建与日志追加由锁保护。
+SQLite 三张表：`runs`（来源、状态、计数、时间）、`tasks`（任务、业务键、回执、错误、证据目录）、`steps`（步骤、动作、状态、尝试次数）。并发运行时任务在派发前按批次顺序预登记，保证报表行序与串行一致；连接启用 WAL 与 busy_timeout，所有写事务经进程内写锁串行化，避免 `database is locked`。汇总写到 `runs/<run_id>/summary.json` 与 `summary.csv`，包含成功/失败/跳过数、失败原因分布、平均耗时与回执列表，统计口径与串行场景完全相同。
 ## 故障注入与 mock 站点
 `python -m fillbot mock-serve --chaos --chaos-seed 7 --chaos-rate 0.2 --delay-ms 50 --flaky-submit` 可启用确定性故障；也可用 `FILLBOT_CHAOS*` 环境变量。`--flaky-submit` 只让指定企业（默认 C003）首次提交返回 500，用于验证重试与证据。mock 站点含登录、三步填报、确认、提交、回执路由以及 `/healthz`、`/__mock/receipts` 辅助端点。
 ## 设计取舍
 - **requests 而非浏览器**：体积小、离线友好、可精确控制会话与 multipart；代价是不执行 JavaScript，目标站点需为服务端渲染表单。
-- **串行执行**：避免并发提交造成重复写入，换取简单可靠的幂等与限速；吞吐通过任务批量和速率配置调节。
-- **SQLite 作为唯一事实源**：便于恢复和审计；证据文件仅作旁证。唯一的回执索引是最后一道防线。
+- **可配置并发，默认串行**：`max_concurrency` 默认 `1`，行为与历史串行完全一致；调高后批次内任务在线程池中并发执行。每个任务使用独立浏览器会话（Cookie/CSRF 不跨企业串号），共享的限速器、SQLite 台账与证据存储各自加锁，幂等、重试、断点续跑语义不变。
+- **SQLite 作为唯一事实源**：便于恢复和审计；证据文件仅作旁证。台账开启 WAL + busy_timeout 并以进程内写锁串行化写入，消除同一 Runner 内多线程的锁冲突与回执竞态。进程内的 biz_key 串行化与写锁只覆盖单进程批次内并发；跨进程/跨机器的重复提交仍由回执号部分唯一索引兜底，分布式工作队列见路线图。
 - **严格契约**：未知配置、动作、参数、变量一律报错，避免“静默成功”造成假报送。
 - **mock 先行**：默认只允许回环目标，所有示例和测试在无外网环境可复现。
 ## 测试与离线保证
@@ -128,5 +129,5 @@ SQLite 三张表：`runs`（来源、状态、计数、时间）、`tasks`（任
 - 增加 JSON Schema 导出与编辑器补全，降低脚本编写门槛。
 - 支持可插拔的授权目标适配器和更细粒度的字段级重试。
 - 增加运行指标（Prometheus 文本格式）与证据加密归档。
-- 提供可选的并发执行器（按 biz_key 分区）与更完善的人工接管队列。
+- 在现有批次内并发基础上，提供跨进程的分布式工作队列与更完善的人工接管队列。
 - 持续补充离线契约测试；不计划加入验证码绕过、隐身或未授权采集能力。

@@ -1,7 +1,15 @@
-"""SQLite ledger: runs, tasks and steps, with a global receipt uniqueness rule."""
+"""SQLite ledger: runs, tasks and steps, with a global receipt uniqueness rule.
+
+Concurrency model: multiple worker threads within one process share a Ledger.
+WAL journal mode plus a busy timeout let readers and one writer coexist, while
+an in-process write lock serialises write transactions so workers never race
+on ``database is locked``. The partial unique index on receipt numbers stays
+the cross-process last line of defence against duplicate submissions.
+"""
 from __future__ import annotations
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -35,12 +43,20 @@ class Ledger:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Re-entrant: a public method may call another locked method while
+        # keeping a single, well-defined critical section per transaction.
+        self._write_lock = threading.RLock()
         self.initialize()
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=30.0)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        # WAL + busy timeout make concurrent readers/writers resilient;
+        # the in-process lock below removes contention between our threads.
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA busy_timeout = 30000")
+        connection.execute("PRAGMA synchronous = NORMAL")
         try:
             yield connection
             connection.commit()
@@ -50,14 +66,14 @@ class Ledger:
         finally:
             connection.close()
     def _write(self, sql: str, params: tuple[Any, ...]) -> None:
-        with self.connect() as connection:
+        with self._write_lock, self.connect() as connection:
             connection.execute(sql, params)
     def _fetch(self, sql: str, params: tuple[Any, ...], *, one: bool = False) -> Any:
         with self.connect() as connection:
             cursor = connection.execute(sql, params)
             return cursor.fetchone() if one else cursor.fetchall()
     def initialize(self) -> None:
-        with self.connect() as connection:
+        with self._write_lock, self.connect() as connection:
             connection.executescript(SCHEMA)
     def create_run(self, run: RunRecord) -> None:
         self._write(
@@ -95,8 +111,21 @@ class Ledger:
                 run.run_id,
             ),
         )
+    def register_task(self, run_id: str, task: TaskRecord, evidence_dir: str) -> None:
+        """Pre-register a task in ``pending`` state.
+
+        Rows are inserted in batch order before any worker starts, so the
+        ``rowid`` ordering used by reports stays identical to serial runs
+        regardless of which worker finishes first.
+        """
+        self._write(
+            "INSERT INTO tasks (run_id, task_id, biz_key, status, evidence_dir) VALUES (?, ?, ?, 'pending', ?) "
+            "ON CONFLICT(run_id, task_id) DO NOTHING",
+            (run_id, task.task_id, task.biz_key, evidence_dir),
+        )
+
     def start_task(self, run_id: str, task: TaskRecord, started_at: str, evidence_dir: str) -> None:
-        with self.connect() as connection:
+        with self._write_lock, self.connect() as connection:
             connection.execute(
                 "INSERT INTO tasks (run_id, task_id, biz_key, status, started_at, evidence_dir) VALUES (?, ?, ?, 'running', ?, ?) "
                 "ON CONFLICT(run_id, task_id) DO UPDATE SET status = 'running', started_at = excluded.started_at, finished_at = NULL, "
@@ -118,31 +147,34 @@ class Ledger:
         receipt_no: str | None = None,
         evidence_dir: str = "",
     ) -> None:
-        if receipt_no:
-            duplicate = self._fetch(
-                "SELECT run_id, task_id FROM tasks WHERE receipt_no = ? AND NOT (run_id = ? AND task_id = ?)",
-                (receipt_no, run_id, task_id),
-                one=True,
+        # Duplicate check and the update share one write transaction so two
+        # workers can never interleave between check and insert; the partial
+        # unique index remains the hard guarantee across processes.
+        with self._write_lock, self.connect() as connection:
+            if receipt_no:
+                duplicate = connection.execute(
+                    "SELECT run_id, task_id FROM tasks WHERE receipt_no = ? AND NOT (run_id = ? AND task_id = ?)",
+                    (receipt_no, run_id, task_id),
+                ).fetchone()
+                if duplicate is not None:
+                    raise ScriptError(
+                        f"duplicate receipt number {receipt_no} already used by {duplicate['run_id']}/{duplicate['task_id']}"
+                    )
+            connection.execute(
+                "UPDATE tasks SET status = ?, finished_at = ?, duration_ms = ?, attempts = ?, error_class = ?, error_message = ?, receipt_no = ?, evidence_dir = ? WHERE run_id = ? AND task_id = ?",
+                (
+                    status,
+                    finished_at,
+                    duration_ms,
+                    attempts,
+                    error_class,
+                    error_message,
+                    receipt_no,
+                    evidence_dir,
+                    run_id,
+                    task_id,
+                ),
             )
-            if duplicate is not None:
-                raise ScriptError(
-                    f"duplicate receipt number {receipt_no} already used by {duplicate['run_id']}/{duplicate['task_id']}"
-                )
-        self._write(
-            "UPDATE tasks SET status = ?, finished_at = ?, duration_ms = ?, attempts = ?, error_class = ?, error_message = ?, receipt_no = ?, evidence_dir = ? WHERE run_id = ? AND task_id = ?",
-            (
-                status,
-                finished_at,
-                duration_ms,
-                attempts,
-                error_class,
-                error_message,
-                receipt_no,
-                evidence_dir,
-                run_id,
-                task_id,
-            ),
-        )
     def record_step(self, run_id: str, task_id: str, step: StepResult) -> None:
         self._write(
             f"INSERT INTO steps ({_STEP_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "

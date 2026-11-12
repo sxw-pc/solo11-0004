@@ -168,24 +168,28 @@ def create_app(
         account = current_account()
         assert account is not None
         period = str(data.get("step1", {}).get("period", ""))
-        existing = mock_store.find_submission(account.company_id, period)
-        if existing is not None:
-            return error_page([f"该企业本季度已报送，回执号 {existing.receipt_no}"], status=409, title="重复报送")
-        submission = mock_store.add_submission(
+        submission = mock_store.submit_if_absent(
             account.company_id, period, {key: data.get(key) for key in ("step1", "step2", "step3")}
         )
+        if submission is None:
+            existing = mock_store.find_submission(account.company_id, period)
+            return error_page(
+                [f"该企业本季度已报送，回执号 {existing.receipt_no if existing else ''}"],
+                status=409,
+                title="重复报送",
+            )
         session["last_receipt"] = submission.receipt_no
         return render_template("receipt.html", receipt=submission, submission=submission)
     @app.get("/receipt/<receipt_no>")
     @login_required
     def receipt_page(receipt_no: str) -> Response | str | tuple[str, int]:
-        for item in mock_store.submissions:
-            if item.receipt_no == receipt_no:
-                return render_template("receipt.html", receipt=item, submission=item)
+        item = mock_store.find_receipt(receipt_no)
+        if item is not None:
+            return render_template("receipt.html", receipt=item, submission=item)
         return error_page(["回执不存在"], status=404, title="回执不存在")
     @app.get("/__mock/receipts")
     def mock_receipts() -> Response:
-        return jsonify({"count": len(mock_store.submissions), "receipts": mock_store.receipts()})
+        return jsonify({"count": mock_store.submission_count(), "receipts": mock_store.receipts()})
     @app.get("/__mock/slow")
     def mock_slow() -> Response:
         try:

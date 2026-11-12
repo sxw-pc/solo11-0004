@@ -34,6 +34,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--script", required=True)
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--rate-limit", type=int)
+    run.add_argument("--concurrency", type=int, help="max concurrent tasks in this batch (default: config max_concurrency)")
     run.add_argument("--base-url")
     resume = sub.add_parser("resume", parents=[common], help="continue an interrupted run")
     resume.add_argument("run_id")
@@ -47,6 +48,10 @@ def _config(args: argparse.Namespace) -> BotConfig:
         if args.rate_limit < 1:
             raise BotError("--rate-limit must be >= 1")
         overrides["rate_limit_per_minute"] = args.rate_limit
+    if getattr(args, "concurrency", None) is not None:
+        if args.concurrency < 1:
+            raise BotError("--concurrency must be >= 1")
+        overrides["max_concurrency"] = args.concurrency
     if getattr(args, "base_url", None):
         overrides["base_url"] = args.base_url
     return load_config(getattr(args, "config", None), overrides=overrides)
@@ -63,7 +68,7 @@ def _run(args: argparse.Namespace, config: BotConfig) -> int:
         task_source=str(Path(args.tasks).resolve()),
         script_source=str(Path(args.script).resolve()),
         dry_run=args.dry_run,
-        options={"rate_limit_per_minute": config.rate_limit_per_minute},
+        options={"rate_limit_per_minute": config.rate_limit_per_minute, "max_concurrency": config.max_concurrency},
     )
     print_summary(runner.ledger, run.run_id)
     print(f"summary: {config.runs_dir / run.run_id / 'summary.json'}")
