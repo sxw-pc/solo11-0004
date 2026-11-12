@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import pytest
 from fillbot.errors import TaskValidationError
+from fillbot.hashing import HashTimeoutError
 from fillbot.intake.loader import load_raw_tasks
 from fillbot.intake.validate import load_and_validate_tasks, validate_raw_tasks
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -131,3 +132,28 @@ def test_loader_errors(tmp_path: Path) -> None:
     with pytest.raises(TaskValidationError) as raised:
         load_raw_tasks(columns)
     assert {issue.field for issue in raised.value.issues} == {"task_id", "biz_key"}
+
+
+def test_attachment_hashes_computed_and_timeout_becomes_issue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fillbot.intake.validate as validate_module
+
+    attachment = tmp_path / "note.pdf"
+    attachment.write_bytes(b"%PDF-1.7\n")
+    doc = _doc(_payload(), attachments=["note.pdf"])
+    doc["_base_dir"] = str(tmp_path)
+    record = validate_raw_tasks([doc])[0]
+    assert len(record.attachment_hashes) == 1 and len(record.attachment_hashes[0]) == 64
+
+    # When hashing overruns the 2s budget the batch fails fast with a located
+    # issue instead of blocking the main flow.
+    def slow_hash(path: object, **kwargs: object) -> str:
+        raise HashTimeoutError("budget exceeded")
+
+    monkeypatch.setattr(validate_module, "sha256_file_bounded", slow_hash)
+    timeout_doc = _doc(_payload(), attachments=["note.pdf"])
+    timeout_doc["_base_dir"] = str(tmp_path)
+    with pytest.raises(TaskValidationError) as raised:
+        validate_raw_tasks([timeout_doc])
+    assert any("hash computation timed out" in issue.message for issue in raised.value.issues)

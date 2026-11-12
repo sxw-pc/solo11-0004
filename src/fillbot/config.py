@@ -19,6 +19,13 @@ _DEFAULTS: dict[str, Any] = {
     "evidence_dir": "evidence",
     "ledger_path": "data/ledger.db",
     "runs_dir": "runs",
+    # Resumable chunked upload. The mock site caps requests at 128 KiB and
+    # attachments at 64 KiB, so 32 KiB chunks always fit (>=2 chunks for any
+    # attachment large enough to take the chunked path).
+    "upload_chunk_size": 32 * 1024,
+    # Files at or below this size keep the legacy single-request upload path,
+    # preserving small-attachment efficiency; defaults to one chunk.
+    "upload_chunk_threshold": 32 * 1024,
     "mask_fields": ["password", "passwd", "secret", "token", "csrf_token"],
 }
 _ENV_MAP = {
@@ -34,6 +41,8 @@ _ENV_MAP = {
     "FILLBOT_EVIDENCE_DIR": "evidence_dir",
     "FILLBOT_LEDGER_PATH": "ledger_path",
     "FILLBOT_RUNS_DIR": "runs_dir",
+    "FILLBOT_UPLOAD_CHUNK_SIZE": "upload_chunk_size",
+    "FILLBOT_UPLOAD_CHUNK_THRESHOLD": "upload_chunk_threshold",
 }
 def _bool(value: Any, name: str) -> bool:
     if isinstance(value, bool):
@@ -59,7 +68,7 @@ def _coerce(key: str, value: Any) -> Any:
         return _num(value, key, float, 0.01)
     if key in {"max_retries", "evidence_keep_runs"}:
         return _num(value, key, int, 0)
-    if key == "rate_limit_per_minute":
+    if key in {"rate_limit_per_minute", "upload_chunk_size", "upload_chunk_threshold"}:
         return _num(value, key, int, 1)
     if key in {"follow_redirects", "jitter"}:
         return _bool(value, key)
@@ -89,6 +98,8 @@ class BotConfig:
     evidence_dir: Path = field(default_factory=lambda: Path("evidence"))
     ledger_path: Path = field(default_factory=lambda: Path("data/ledger.db"))
     runs_dir: Path = field(default_factory=lambda: Path("runs"))
+    upload_chunk_size: int = 32 * 1024
+    upload_chunk_threshold: int = 32 * 1024
     mask_fields: tuple[str, ...] = ("password", "passwd", "secret", "token", "csrf_token")
     def with_overrides(self, **overrides: Any) -> "BotConfig":
         clean = {key: value for key, value in overrides.items() if value is not None}
@@ -137,4 +148,6 @@ def load_config(
     merged["mask_fields"] = tuple(merged["mask_fields"])
     if merged["backoff_base_seconds"] > merged["backoff_max_seconds"]:
         raise ConfigError("backoff_base_seconds cannot exceed backoff_max_seconds")
+    if merged["upload_chunk_threshold"] > merged["upload_chunk_size"]:
+        raise ConfigError("upload_chunk_threshold cannot exceed upload_chunk_size")
     return BotConfig(**merged)

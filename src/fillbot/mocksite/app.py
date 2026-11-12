@@ -9,6 +9,7 @@ from flask import Flask, Response, jsonify, redirect, render_template, request, 
 from fillbot.mocksite.chaos import ChaosController, ChaosSettings
 from fillbot.mocksite.forms_def import validate_step1, validate_step2, validate_step3
 from fillbot.mocksite.seed import Account, MockStore
+from fillbot.mocksite.uploads import init_chunk_uploads
 def create_app(
     *,
     testing: bool = False,
@@ -25,6 +26,9 @@ def create_app(
     mock_store = store or MockStore()
     chaos_controller = ChaosController(chaos or ChaosSettings.from_env())
     app.extensions["fillbot_store"], app.extensions["fillbot_chaos"] = mock_store, chaos_controller
+    # Additive resumable-upload staging area under /__mock; core form routes
+    # (login, step1..3, confirm, submit) are intentionally left unchanged.
+    init_chunk_uploads(app)
     def token() -> str:
         if "csrf_token" not in session:
             session["csrf_token"] = secrets.token_hex(16)

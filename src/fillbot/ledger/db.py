@@ -18,7 +18,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, task_id TEXT NOT NULL, biz_key TEXT NOT NULL,
   status TEXT NOT NULL, started_at TEXT, finished_at TEXT, duration_ms INTEGER NOT NULL DEFAULT 0,
   attempts INTEGER NOT NULL DEFAULT 0, error_class TEXT, error_message TEXT, receipt_no TEXT,
-  evidence_dir TEXT NOT NULL DEFAULT '', UNIQUE(run_id, task_id), FOREIGN KEY(run_id) REFERENCES runs(run_id));
+  evidence_dir TEXT NOT NULL DEFAULT '',
+  attachment_hashes_json TEXT NOT NULL DEFAULT '{}', upload_state_json TEXT,
+  UNIQUE(run_id, task_id), FOREIGN KEY(run_id) REFERENCES runs(run_id));
 CREATE TABLE IF NOT EXISTS steps (
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, task_id TEXT NOT NULL, step_index INTEGER NOT NULL,
   action TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT, finished_at TEXT,
@@ -59,6 +61,12 @@ class Ledger:
     def initialize(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            # Additive migration for ledgers created before resumable uploads.
+            existing = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
+            if "attachment_hashes_json" not in existing:
+                connection.execute("ALTER TABLE tasks ADD COLUMN attachment_hashes_json TEXT NOT NULL DEFAULT '{}'")
+            if "upload_state_json" not in existing:
+                connection.execute("ALTER TABLE tasks ADD COLUMN upload_state_json TEXT")
     def create_run(self, run: RunRecord) -> None:
         self._write(
             "INSERT INTO runs (run_id, started_at, finished_at, status, tasks_total, succeeded, failed, skipped, task_source, script_source, dry_run, base_url, evidence_dir, options_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -95,13 +103,28 @@ class Ledger:
                 run.run_id,
             ),
         )
-    def start_task(self, run_id: str, task: TaskRecord, started_at: str, evidence_dir: str) -> None:
+    def start_task(
+        self,
+        run_id: str,
+        task: TaskRecord,
+        started_at: str,
+        evidence_dir: str,
+        *,
+        attachment_hashes: dict[str, str] | None = None,
+    ) -> None:
+        hashes_json = json.dumps(attachment_hashes or {}, ensure_ascii=False, sort_keys=True)
         with self.connect() as connection:
             connection.execute(
-                "INSERT INTO tasks (run_id, task_id, biz_key, status, started_at, evidence_dir) VALUES (?, ?, ?, 'running', ?, ?) "
-                "ON CONFLICT(run_id, task_id) DO UPDATE SET status = 'running', started_at = excluded.started_at, finished_at = NULL, "
-                "duration_ms = 0, attempts = 0, error_class = NULL, error_message = NULL, receipt_no = NULL, evidence_dir = excluded.evidence_dir",
-                (run_id, task.task_id, task.biz_key, started_at, evidence_dir),
+                "INSERT INTO tasks (run_id, task_id, biz_key, status, started_at, evidence_dir, attachment_hashes_json) "
+                "VALUES (?, ?, ?, 'running', ?, ?, ?) "
+                # On retry within a resume run, keep the previously recorded
+                # hashes and the resumable upload progress (upload_state_json).
+                "ON CONFLICT(run_id, task_id) DO UPDATE SET status = 'running', started_at = excluded.started_at, "
+                "finished_at = NULL, duration_ms = 0, attempts = 0, error_class = NULL, error_message = NULL, "
+                "receipt_no = NULL, evidence_dir = excluded.evidence_dir, "
+                "attachment_hashes_json = CASE WHEN tasks.attachment_hashes_json = '{}' THEN excluded.attachment_hashes_json "
+                "ELSE tasks.attachment_hashes_json END",
+                (run_id, task.task_id, task.biz_key, started_at, evidence_dir, hashes_json),
             )
             connection.execute("DELETE FROM steps WHERE run_id = ? AND task_id = ?", (run_id, task.task_id))
     def finish_task(
@@ -209,3 +232,34 @@ class Ledger:
     def task_status(self, run_id: str, task_id: str) -> str | None:
         row = self._fetch("SELECT status FROM tasks WHERE run_id = ? AND task_id = ?", (run_id, task_id), one=True)
         return str(row["status"]) if row else None
+
+    # ------------------------------------------------------------------
+    # Resumable-upload progress and attachment integrity ledger entries.
+    # ------------------------------------------------------------------
+    def save_upload_state(self, run_id: str, task_id: str, state: dict[str, Any]) -> None:
+        self._write(
+            "UPDATE tasks SET upload_state_json = ? WHERE run_id = ? AND task_id = ?",
+            (json.dumps(state, ensure_ascii=False, sort_keys=True), run_id, task_id),
+        )
+
+    def get_upload_state(self, run_id: str, task_id: str) -> dict[str, Any] | None:
+        row = self._fetch(
+            "SELECT upload_state_json FROM tasks WHERE run_id = ? AND task_id = ?", (run_id, task_id), one=True
+        )
+        if row is None or row["upload_state_json"] is None:
+            return None
+        return json.loads(str(row["upload_state_json"]))
+
+    def get_attachment_hashes(self, run_id: str, task_id: str) -> dict[str, str]:
+        row = self._fetch(
+            "SELECT attachment_hashes_json FROM tasks WHERE run_id = ? AND task_id = ?",
+            (run_id, task_id),
+            one=True,
+        )
+        if row is None:
+            return {}
+        return json.loads(str(row["attachment_hashes_json"] or "{}"))
+
+    def all_attachment_hashes(self, run_id: str) -> dict[str, dict[str, str]]:
+        rows = self._fetch("SELECT task_id, attachment_hashes_json FROM tasks WHERE run_id = ?", (run_id,))
+        return {str(row["task_id"]): json.loads(str(row["attachment_hashes_json"] or "{}")) for row in rows}

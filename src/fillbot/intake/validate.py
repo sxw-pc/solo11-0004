@@ -4,10 +4,14 @@ import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from fillbot.errors import TaskValidationError
+from fillbot.hashing import HashTimeoutError, sha256_file_bounded
 from fillbot.intake.loader import load_raw_tasks
 from fillbot.models import TaskRecord, ValidationIssue
+
+# Main-flow blocking budget for a single attachment hash (requirement: <= 2s).
+HASH_BUDGET_SECONDS = 2.0
 TASK_ID_RE = re.compile(r"^T-[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
 BIZ_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$")
 PERIOD_RE = re.compile(r"^\d{4}-Q[1-4]$")
@@ -101,18 +105,19 @@ def _resolve_attachment(raw: str, base_dir: Path) -> Path | None:
         except OSError:
             continue
     return None
-def _attachments(doc: dict[str, Any], source: str, row: int) -> tuple[list[Path], list[ValidationIssue]]:
+def _attachments(doc: dict[str, Any], source: str, row: int) -> tuple[list[Path], list[str], list[ValidationIssue]]:
     raw = doc.get("attachments")
     if raw is None or raw == "" or raw == []:
-        return [], [ValidationIssue(source, row, "attachments", "is required")]
+        return [], [], [ValidationIssue(source, row, "attachments", "is required")]
     if isinstance(raw, str):
         values: list[Any] = [part.strip() for part in raw.replace("|", ";").split(";") if part.strip()]
     elif isinstance(raw, list):
         values = raw
     else:
-        return [], [ValidationIssue(source, row, "attachments", "must be a list of paths")]
+        return [], [], [ValidationIssue(source, row, "attachments", "must be a list of paths")]
     base_dir = Path(str(doc.get("_base_dir", ".")))
     resolved: list[Path] = []
+    hashes: list[str] = []
     issues: list[ValidationIssue] = []
     for index, item in enumerate(values):
         field = f"attachments[{index}]"
@@ -122,9 +127,15 @@ def _attachments(doc: dict[str, Any], source: str, row: int) -> tuple[list[Path]
         found = _resolve_attachment(item.strip(), base_dir)
         if found is None:
             issues.append(ValidationIssue(source, row, field, f"file not found: {item.strip()}"))
-        else:
-            resolved.append(found)
-    return resolved, issues
+            continue
+        resolved.append(found)
+        try:
+            hashes.append(sha256_file_bounded(found, timeout_seconds=HASH_BUDGET_SECONDS))
+        except HashTimeoutError as exc:
+            issues.append(ValidationIssue(source, row, field, f"hash computation timed out: {exc}"))
+        except OSError as exc:
+            issues.append(ValidationIssue(source, row, field, f"cannot hash attachment: {exc}"))
+    return resolved, hashes, issues
 def _key_issue(
     source: str, row: int, field: str, value: Any, pattern: re.Pattern[str], seen: dict[str, int]
 ) -> tuple[str, list[ValidationIssue]]:
@@ -159,12 +170,67 @@ def validate_raw_tasks(docs: list[dict[str, Any]]) -> list[TaskRecord]:
                 issues.append(ValidationIssue(source, row, f"payload.{name}", error))
             elif normalized is not None:
                 normalized_payload[name] = normalized
-        attachments, attachment_issues = _attachments(doc, source, row)
+        attachments, attachment_hashes, attachment_issues = _attachments(doc, source, row)
         issues.extend(attachment_issues)
         if task_id and biz_key:
-            records.append(TaskRecord(task_id, biz_key, normalized_payload, tuple(attachments), row, source))
+            records.append(
+                TaskRecord(
+                    task_id,
+                    biz_key,
+                    normalized_payload,
+                    tuple(attachments),
+                    row,
+                    source,
+                    tuple(attachment_hashes),
+                )
+            )
     if issues:
         raise TaskValidationError(f"{len(issues)} task validation error(s) across {len(docs)} row(s)", issues)
     return records
+
+
+def verify_attachment_hashes(
+    tasks: list[TaskRecord], ledger_hashes: Mapping[str, Mapping[str, str]]
+) -> None:
+    """Block tasks whose freshly computed attachment hashes drift from the ledger.
+
+    ``ledger_hashes`` maps ``task_id`` to a mapping of attachment path -> SHA256,
+    as persisted by the ledger when the task first ran. A mismatch (or a missing
+    local hash caused by earlier hashing failure) aborts the whole batch before
+    any network activity, satisfying the resume-time consistency gate.
+    """
+    issues: list[ValidationIssue] = []
+    for task in tasks:
+        recorded = ledger_hashes.get(task.task_id)
+        if not recorded:
+            continue
+        if len(task.attachment_hashes) != len(task.attachments):
+            issues.append(
+                ValidationIssue(
+                    task.source_file or "<memory>",
+                    task.source_row,
+                    "attachments",
+                    "attachment hashes unavailable; refusing to resume an unverified task",
+                )
+            )
+            continue
+        for path, actual in zip(task.attachments, task.attachment_hashes):
+            # Ledger keys are resolved absolute paths; accept either form.
+            expected = recorded.get(str(path)) or recorded.get(str(path.resolve()))
+            if expected is not None and expected != actual:
+                issues.append(
+                    ValidationIssue(
+                        task.source_file or "<memory>",
+                        task.source_row,
+                        "attachments",
+                        f"hash mismatch for {path}: ledger={expected} local={actual}",
+                    )
+                )
+    if issues:
+        raise TaskValidationError(
+            f"{len(issues)} attachment hash mismatch(es); batch blocked to prevent corrupt uploads", issues
+        )
+
+
 def load_and_validate_tasks(path: str | Path) -> list[TaskRecord]:
     return validate_raw_tasks(load_raw_tasks(path))

@@ -13,6 +13,7 @@ from fillbot.dsl.engine import DSLExecutor
 from fillbot.dsl.schema import Script
 from fillbot.errors import BotError, ScriptError
 from fillbot.evidence.store import EvidenceStore, is_sensitive
+from fillbot.intake.validate import verify_attachment_hashes
 from fillbot.ledger.db import Ledger
 from fillbot.ledger.report import export_summary
 from fillbot.models import RunRecord, RunStatus, TaskRecord, TaskStatus, elapsed_ms, iso_now, utcnow
@@ -42,10 +43,29 @@ class Runner:
         self._browser_factory = browser_factory
         self._logger = logger
         self._file_handler: logging.FileHandler | None = None
-    def _factory(self) -> BrowserSession:
+    def _factory(self, task: TaskRecord | None = None, run_id: str = "") -> BrowserSession:
         if self._browser_factory is not None:
             return self._browser_factory()
-        return MechanicalBrowser(timeout=self.config.timeout_seconds, follow_redirects=self.config.follow_redirects, limiter=self.limiter.wait)
+        browser = MechanicalBrowser(
+            timeout=self.config.timeout_seconds,
+            follow_redirects=self.config.follow_redirects,
+            limiter=self.limiter.wait,
+        )
+        if task is not None and run_id:
+            expected = {
+                str(path.resolve()): digest
+                for path, digest in zip(task.attachments, task.attachment_hashes)
+            }
+            browser.configure_chunk_uploads(
+                self.config.base_url,
+                chunk_size=self.config.upload_chunk_size,
+                threshold=self.config.upload_chunk_threshold,
+                run_id=run_id,
+                task_id=task.task_id,
+                expected_hashes=expected,
+                checkpoint_store=self.ledger,
+            )
+        return browser
     def _setup_logging(self, run_id: str) -> logging.Logger:
         run_dir = self.config.runs_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -80,10 +100,13 @@ class Runner:
     def _execute_task(self, run_id: str, task: TaskRecord, script: Script, logger: logging.Logger, dry_run: bool) -> tuple[TaskStatus, str | None, str | None, str | None, int, str, list]:
         started, started_at = utcnow(), iso_now()
         evidence_dir = str(self.evidence.task_dir(run_id, task.task_id))
-        self.ledger.start_task(run_id, task, started_at, evidence_dir)
+        attachment_hashes = {
+            str(path.resolve()): digest for path, digest in zip(task.attachments, task.attachment_hashes)
+        }
+        self.ledger.start_task(run_id, task, started_at, evidence_dir, attachment_hashes=attachment_hashes)
         logger.info("task %s started biz_key=%s", task.task_id, task.biz_key)
         secrets, snapshots = self._secrets(task), {}
-        browser = self._factory()
+        browser = self._factory(task, run_id)
         env = {**os.environ, "FILLBOT_BASE_URL": self.config.base_url}
         def snapshot_cb(step, page, status):
             snapshots[step.index] = str(
@@ -222,6 +245,10 @@ class Runner:
             logger.info("start run=%s tasks=%s dry_run=%s", rid, len(tasks), dry_run)
         try:
             completed = set(plan_resume(self.ledger, rid, tasks).completed_task_ids) if resume else set()
+            if resume:
+                # Requirement 2: block the batch when an attachment's current
+                # SHA256 no longer matches the digest recorded in the ledger.
+                verify_attachment_hashes(list(tasks), self.ledger.all_attachment_hashes(rid))
             for task in tasks:
                 if task.task_id in completed:
                     logger.info("task %s already complete; skipped on resume", task.task_id)

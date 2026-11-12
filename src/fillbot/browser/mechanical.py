@@ -1,5 +1,6 @@
 """requests + BeautifulSoup adapter: cookies, CSRF, forms and multipart upload."""
 from __future__ import annotations
+import logging
 import mimetypes
 import time
 from dataclasses import dataclass
@@ -9,8 +10,10 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup, Tag
 from fillbot.browser.base import BrowserSession, Locator, Page
+from fillbot.browser.chunking import ChunkUploadManager
 from fillbot.dsl import selectors
 from fillbot.errors import ClientError, NetworkError, ScriptError, ServerError
+logger = logging.getLogger("fillbot.browser")
 @dataclass
 class _Pending:
     locator: Locator
@@ -33,6 +36,7 @@ class MechanicalBrowser(BrowserSession):
         follow_redirects: bool = True,
         limiter: Callable[[], None] | None = None,
         session: requests.Session | None = None,
+        chunk_manager: ChunkUploadManager | None = None,
     ) -> None:
         self.timeout, self.follow_redirects, self._limiter = timeout, follow_redirects, limiter
         self._session = session or requests.Session()
@@ -41,6 +45,40 @@ class MechanicalBrowser(BrowserSession):
         self._page: Page | None = None
         self._pending: dict[str, _Pending] = {}
         self._last_submission: _Submission | None = None
+        # Optional resumable-upload manager. When absent (standalone adapter
+        # usage and small files below the threshold) the legacy single-request
+        # multipart path is used unchanged.
+        self._chunks = chunk_manager
+        self._owns_chunk_manager = False
+
+    def configure_chunk_uploads(
+        self,
+        base_url: str,
+        *,
+        chunk_size: int,
+        threshold: int,
+        run_id: str,
+        task_id: str,
+        expected_hashes: dict[str, str] | None = None,
+        checkpoint_store: object | None = None,
+        temp_root: str | Path | None = None,
+    ) -> ChunkUploadManager:
+        """Attach a resumable-upload manager (used by the runner per task)."""
+        manager = ChunkUploadManager(
+            self._session,
+            base_url,
+            chunk_size=chunk_size,
+            threshold=threshold,
+            run_id=run_id,
+            task_id=task_id,
+            expected_hashes=expected_hashes,
+            checkpoint_store=checkpoint_store,  # type: ignore[arg-type]
+            temp_root=temp_root,
+            limiter=self._limiter,
+        )
+        self._chunks = manager
+        self._owns_chunk_manager = True
+        return manager
     @property
     def page(self) -> Page:
         if self._page is None:
@@ -133,16 +171,36 @@ class MechanicalBrowser(BrowserSession):
             elif pending.kind == "uncheck":
                 data.pop(name, None)
             elif pending.path is not None:
-                files[name] = (
-                    pending.path.name,
-                    pending.path.read_bytes(),
-                    mimetypes.guess_type(pending.path.name)[0] or "application/octet-stream",
-                )
+                files[name] = self._file_payload(pending.path)
         if trigger.get("name") and str(trigger.get("type", "")).lower() in {"submit", "button"}:
             data[str(trigger.get("name"))] = str(trigger.get("value", ""))
         method = str(trigger.get("formmethod") or form.get("method") or "GET").upper()
         action = str(trigger.get("formaction") or form.get("action") or "")
         return _Submission(locator, method, urljoin(self.page.url, action) if action else self.page.url, data, files)
+
+    def _file_payload(self, path: Path) -> tuple[str, bytes, str]:
+        """Build a multipart file payload, staging large files resumably first.
+
+        Small files take the unchanged legacy path (one multipart POST), which
+        keeps their overhead within the efficiency budget. Files above the
+        configured threshold are first chunk-staged with breakpoint resume and
+        server-side hash verification; the form POST itself still carries the
+        full file so the site's core upload interface is not modified.
+        """
+        if self._chunks is not None and self._chunks.should_chunk(path):
+            staged = self._chunks.stage_file(path)
+            logger.info(
+                "resumable upload staged %s chunks_sent=%s resumed=%s total_chunks=%s",
+                path.name,
+                staged.chunks_sent,
+                staged.resumed,
+                staged.total_chunks,
+            )
+        return (
+            path.name,
+            path.read_bytes(),
+            mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+        )
     def click(self, locator: Locator, *, timeout: float | None = None) -> Page:
         try:
             submission = self._prepare_form(locator)
@@ -218,3 +276,9 @@ class MechanicalBrowser(BrowserSession):
     def close(self) -> None:
         self._session.close()
         self._pending.clear()
+        if self._chunks is not None and self._owns_chunk_manager:
+            # Temporary chunk files live in the system temp dir; remove them as
+            # soon as the task's browser session ends.
+            self._chunks.cleanup()
+            self._chunks = None
+            self._owns_chunk_manager = False

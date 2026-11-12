@@ -29,25 +29,26 @@ python -m fillbot report <run_id> --config configs/bot.example.yaml
 `validate` 完全离线，仅检查任务与脚本；`run` 默认串行执行。mock 账号（虚构）：`parkco-b / mock-only-beta`（C002，正常）、`parkco-c / mock-only-gamma`（C003，可注入提交故障）。
 ## 架构
 ```text
-tasks (JSON/CSV) ──> intake loader ──> validator (row + field diagnostics)
+tasks (JSON/CSV) ──> intake loader ──> validator (row + field + SHA256 hash diagnostics)
                                             │
 scripts (YAML) ──> DSL schema ──> DSL engine ──> MechanicalBrowser (requests/BeautifulSoup)
                                             │              │
                                             │              ├─ login / multi-step forms / CSRF / upload
-                                            │              └─ submit / receipt extraction
+                                            │              └─ chunked resumable upload (checkpoint + hash verify) / submit
                                             ├─ retry policy (backoff + jitter + Retry-After)
                                             ├─ evidence store (HTML, actions.jsonl, receipt.html)
-                                            └─ ledger (SQLite: runs / tasks / steps) ──> summary.json / summary.csv
+                                            └─ ledger (SQLite: runs / tasks[hashes, upload state] / steps) ──> summary.json / summary.csv
 ```
 ## 目录
 ```text
-src/fillbot/browser/     requests+BeautifulSoup 适配器、页面模型、脱敏
+src/fillbot/browser/     requests+BeautifulSoup 适配器、页面模型、脱敏、分片续传（chunking.py）
 src/fillbot/dsl/         脚本 schema、动作实现、选择器、执行引擎
-src/fillbot/intake/      JSON/CSV 载入、字段规范化与聚合校验
+src/fillbot/intake/      JSON/CSV 载入、字段规范化、哈希计算与聚合校验
 src/fillbot/runner/      串行调度、重试、状态机、限速、续跑
-src/fillbot/ledger/      SQLite 台账与汇总报表
+src/fillbot/ledger/      SQLite 台账（含分片断点/附件哈希列）与汇总报表
 src/fillbot/evidence/    证据目录、HTML 脱敏、保留策略
-src/fillbot/mocksite/    仅回环的 Flask 虚构报送站点
+src/fillbot/hashing.py   有界、线程化 SHA256 工具
+src/fillbot/mocksite/    仅回环的 Flask 虚构报送站点（含 /__mock/uploads 分片端点）
 scripts/ tasks/ tests/   示例脚本、任务清单、离线测试
 ```
 ## 任务清单
@@ -103,6 +104,8 @@ steps:
 | `evidence_keep_runs` / `FILLBOT_EVIDENCE_KEEP_RUNS` | 10 | 保留最近运行数 |
 | `ledger_path` / `FILLBOT_LEDGER_PATH` | `data/ledger.db` | SQLite 台账路径 |
 | `runs_dir` / `FILLBOT_RUNS_DIR` | `runs` | run.log 与汇总目录 |
+| `upload_chunk_size` / `FILLBOT_UPLOAD_CHUNK_SIZE` | 32768 | 断点续传分片大小（字节），默认适配 mock 站点 128 KiB 请求 / 64 KiB 附件限制 |
+| `upload_chunk_threshold` / `FILLBOT_UPLOAD_CHUNK_THRESHOLD` | 32768 | 大于该值才走分片；小文件保持单次 multipart 上传，效率不受影响（阈值不得超过分片大小） |
 | `mask_fields` | password/passwd/secret/token/csrf_token | 证据脱敏字段 |
 ## 错误、重试与状态
 错误类别：`NETWORK`、`SERVER`（均含 429/5xx）、`CLIENT`（4xx）、`ASSERT`、`SCRIPT`。只有 NETWORK/SERVER 自动重试；`Retry-After` 优先，其次指数退避 + 抖动。任务状态：`pending → running → success|failed|skipped|dry_run`；运行状态：`running → success|failed|interrupted|dry_run`，`interrupted/failed` 可续跑。未捕获异常（含 Ctrl+C/SystemExit）会把运行标记为 `interrupted` 后继续抛出。
@@ -111,11 +114,18 @@ steps:
 - 回执号必须匹配 `RCP-YYYYMMDD-NNNN` 且全局唯一（SQLite 部分唯一索引 + 运行时检查）。
 - `--dry-run` 真实执行并留存步骤证据，但遇到 `final: true` 的点击前停止，状态为 `dry_run`，不产生回执。
 - `resume <run_id>` 从台账读取原任务/脚本路径，跳过 `success|skipped`，只执行余下任务；已成功的 `biz_key` 不会重复提交。
+
+## 附件断点续传与一致性校验
+- **SHA256 准入校验**：任务清单载入时（intake）在守护线程中流式计算每个附件的 SHA256（1 MiB 分块），主流程等待预算 2 秒，超时转为定位到行/字段的校验错误，不阻塞批次。续跑时把当前哈希与台账 `tasks.attachment_hashes_json` 记录值比对，不一致直接 `TaskValidationError` 拦截，杜绝损坏文件上传。
+- **分片断点续传**：大于 `upload_chunk_threshold` 的附件按 `upload_chunk_size` 切分，分片临时文件写入系统临时目录（`fillbot-upload-<run>-<task>-*`），每成功一个分片即把断点（已传分片、总片数、哈希、临时目录）写入 SQLite `tasks.upload_state_json`。重试或进程重启后先向服务端对账，只传缺失分片，已完成分片绝不重传；服务端组装后返回整文件哈希，与本地不一致即失败。小文件走原有单次 multipart 路径，实测额外开销 < 1%。
+- **自动清理**：任务结束（含失败）关闭浏览器会话时删除本分片临时目录；新管理器启动时兜底清理硬杀进程遗留的孤儿目录。
+- **mock 站点协议（仅增量、不改核心上传接口）**：`PUT /__mock/uploads/<id>/chunks/<n>`（携带分片与整文件 SHA256 头，幂等）、`GET /__mock/uploads/<id>`（进度与组装哈希）、`POST /__mock/uploads/faults`（测试用故障注入）。原 `/report/step3` 等表单路由逻辑保持不变。
+- DSL `upload` 动作参数与任务清单 `attachments` 字段格式均未改变，哈希仅在内部计算并落台账。
 ## 证据与台账
 证据位于 `evidence/<run_id>/<task_id>/`：每步 `step-NN.html`（密码、token、secret 字段及已知敏感值替换为 `***`）、`actions.jsonl`（动作、定位器、结果、耗时、错误，不含填写值）、成功提交后的 `receipt.html`。证据快照会强制保存，便于审计后复核；保留策略只清理超期运行目录，不动台账。
-SQLite 三张表：`runs`（来源、状态、计数、时间）、`tasks`（任务、业务键、回执、错误、证据目录）、`steps`（步骤、动作、状态、尝试次数）。汇总写到 `runs/<run_id>/summary.json` 与 `summary.csv`，包含成功/失败/跳过数、失败原因分布、平均耗时与回执列表。
+SQLite 三张表：`runs`（来源、状态、计数、时间）、`tasks`（任务、业务键、回执、错误、证据目录，并含 `attachment_hashes_json` 附件哈希与 `upload_state_json` 分片断点两列，旧库打开时自动补列迁移）、`steps`（步骤、动作、状态、尝试次数）。汇总写到 `runs/<run_id>/summary.json` 与 `summary.csv`，包含成功/失败/跳过数、失败原因分布、平均耗时与回执列表。
 ## 故障注入与 mock 站点
-`python -m fillbot mock-serve --chaos --chaos-seed 7 --chaos-rate 0.2 --delay-ms 50 --flaky-submit` 可启用确定性故障；也可用 `FILLBOT_CHAOS*` 环境变量。`--flaky-submit` 只让指定企业（默认 C003）首次提交返回 500，用于验证重试与证据。mock 站点含登录、三步填报、确认、提交、回执路由以及 `/healthz`、`/__mock/receipts` 辅助端点。
+`python -m fillbot mock-serve --chaos --chaos-seed 7 --chaos-rate 0.2 --delay-ms 50 --flaky-submit` 可启用确定性故障；也可用 `FILLBOT_CHAOS*` 环境变量。`--flaky-submit` 只让指定企业（默认 C003）首次提交返回 500，用于验证重试与证据。mock 站点含登录、三步填报、确认、提交、回执路由以及 `/healthz`、`/__mock/receipts` 辅助端点；另有 `/__mock/uploads/*` 增量分片续传端点（含故障注入），不改动核心表单上传接口。
 ## 设计取舍
 - **requests 而非浏览器**：体积小、离线友好、可精确控制会话与 multipart；代价是不执行 JavaScript，目标站点需为服务端渲染表单。
 - **串行执行**：避免并发提交造成重复写入，换取简单可靠的幂等与限速；吞吐通过任务批量和速率配置调节。

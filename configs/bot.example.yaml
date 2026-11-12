@@ -11,6 +11,13 @@ evidence_keep_runs: 10
 evidence_dir: evidence
 ledger_path: data/ledger.db
 runs_dir: runs
+# Resumable chunked uploads. Files larger than upload_chunk_threshold are
+# staged in upload_chunk_size pieces with SQLite-persisted breakpoints; files
+# at or below the threshold keep the single-request upload path. Defaults
+# (32 KiB) fit the loopback mock site's 128 KiB request / 64 KiB attachment
+# limits. Overridable via FILLBOT_UPLOAD_CHUNK_SIZE / FILLBOT_UPLOAD_CHUNK_THRESHOLD.
+upload_chunk_size: 32768
+upload_chunk_threshold: 32768
 mask_fields:
   - password
   - passwd

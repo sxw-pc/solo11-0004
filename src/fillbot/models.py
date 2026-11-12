@@ -36,6 +36,9 @@ class TaskRecord:
     attachments: tuple[Path, ...] = ()
     source_row: int = 0
     source_file: str = ""
+    # SHA256 of each attachment, aligned 1:1 with ``attachments``. Filled in by
+    # the intake layer; empty tuple only for records built by legacy callers.
+    attachment_hashes: tuple[str, ...] = ()
     @property
     def attachment(self) -> Path | None:
         return self.attachments[0] if self.attachments else None
