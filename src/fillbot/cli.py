@@ -1,4 +1,4 @@
-"""Command-line interface: mock-serve, validate, run, resume, report."""
+"""Command-line interface: mock-serve, validate, run, resume, report, confirmations."""
 from __future__ import annotations
 import argparse
 import sys
@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Sequence
 from fillbot.config import BotConfig, load_config
 from fillbot.dsl.schema import load_script
-from fillbot.errors import BotError, TaskValidationError
+from fillbot.errors import BotError, ConfirmationError, TaskValidationError
 from fillbot.intake import load_and_validate_tasks
 from fillbot.ledger.db import Ledger
 from fillbot.ledger.report import print_summary
@@ -40,6 +40,23 @@ def _parser() -> argparse.ArgumentParser:
     resume.add_argument("--base-url")
     report = sub.add_parser("report", parents=[common], help="print ledger summary")
     report.add_argument("run_id")
+    confirmations = sub.add_parser(
+        "confirmations", help="manage human confirmation gates"
+    )
+    conf_sub = confirmations.add_subparsers(dest="conf_command", required=True)
+    conf_list = conf_sub.add_parser("list", parents=[common], help="list tasks awaiting human confirmation")
+    conf_list.add_argument("--run", dest="run_id")
+    conf_approve = conf_sub.add_parser("approve", parents=[common], help="approve one or more one-time confirmation tokens")
+    conf_approve.add_argument("--token", dest="tokens", action="append", default=[], help="confirmation token (repeatable for batch approval)")
+    conf_approve.add_argument("--tasks", required=True)
+    conf_approve.add_argument("--script", required=True)
+    conf_approve.add_argument("--actor", default="operator")
+    conf_approve.add_argument("--note", default="")
+    conf_reject = conf_sub.add_parser("reject", parents=[common], help="reject a token and record a human abandonment")
+    conf_reject.add_argument("--token", required=True)
+    conf_reject.add_argument("--tasks", required=True)
+    conf_reject.add_argument("--actor", default="operator")
+    conf_reject.add_argument("--note", default="")
     return parser
 def _config(args: argparse.Namespace) -> BotConfig:
     overrides: dict[str, object] = {}
@@ -67,6 +84,66 @@ def _run(args: argparse.Namespace, config: BotConfig) -> int:
     )
     print_summary(runner.ledger, run.run_id)
     print(f"summary: {config.runs_dir / run.run_id / 'summary.json'}")
+    _print_issued_tokens(runner, run.run_id)
+    return 0
+def _print_issued_tokens(runner: Runner, run_id: str) -> None:
+    pending = {
+        (record.run_id, record.task_id): record
+        for record in runner.list_pending_confirmations(run_id=run_id)
+    }
+    for (rid, task_id), token in runner.issued_tokens.items():
+        record = pending.get((rid, task_id))
+        if record is None:
+            continue
+        print(
+            "\n=== HUMAN CONFIRMATION REQUIRED ===\n"
+            f"task:           {task_id} (biz_key={record.biz_key})\n"
+            f"confirmation:   {record.confirmation_id}\n"
+            f"evidence:       {record.evidence_dir}/confirmation-snapshot.html\n"
+            f"one-time token: {token}\n"
+            "approve:  fillbot confirmations approve --token <token> --tasks <tasks> --script <script>\n"
+            "reject:   fillbot confirmations reject  --token <token> --tasks <tasks>\n"
+            "====================================="
+        )
+def _load_runner_tasks_script(args: argparse.Namespace, config: BotConfig) -> tuple[Runner, list, object]:
+    runner = Runner(config)
+    return runner, load_and_validate_tasks(args.tasks), load_script(args.script)
+def _confirmations_list(args: argparse.Namespace, config: BotConfig) -> int:
+    runner = Runner(config)
+    records = runner.list_pending_confirmations(run_id=args.run_id)
+    if not records:
+        print("no tasks awaiting human confirmation")
+        return 0
+    print(f"{len(records)} task(s) awaiting human confirmation:")
+    for record in records:
+        print(
+            f"- {record.confirmation_id} run={record.run_id} task={record.task_id} biz_key={record.biz_key} "
+            f"gate_step={record.gate_step_index} since={record.created_at}\n  evidence={record.evidence_dir}"
+        )
+    return 0
+def _confirmations_approve(args: argparse.Namespace, config: BotConfig) -> int:
+    if not args.tokens:
+        raise ConfirmationError("at least one --token is required")
+    runner, tasks, script = _load_runner_tasks_script(args, config)
+    if len(args.tokens) == 1:
+        confirmation, status = runner.approve_confirmation(
+            args.tokens[0], tasks, script, actor=args.actor, note=args.note
+        )
+        outcomes = [(confirmation, status)]
+    else:
+        outcomes = runner.approve_confirmations_batch(
+            args.tokens, tasks, script, actor=args.actor, note=args.note
+        )
+    for confirmation, status in outcomes:
+        print(f"approved {confirmation.confirmation_id} task={confirmation.task_id} -> {status.value}")
+        print_summary(runner.ledger, confirmation.run_id)
+    return 0
+def _confirmations_reject(args: argparse.Namespace, config: BotConfig) -> int:
+    runner = Runner(config)
+    tasks = load_and_validate_tasks(args.tasks)
+    confirmation = runner.reject_confirmation(args.token, tasks, actor=args.actor, note=args.note)
+    print(f"rejected {confirmation.confirmation_id} task={confirmation.task_id} -> abandoned (human decision)")
+    print_summary(runner.ledger, confirmation.run_id)
     return 0
 def _resume(args: argparse.Namespace, config: BotConfig) -> int:
     ledger = Ledger(config.ledger_path)
@@ -127,12 +204,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _resume(args, config)
         if args.command == "report":
             return _report(args, config)
+        if args.command == "confirmations":
+            if args.conf_command == "list":
+                return _confirmations_list(args, config)
+            if args.conf_command == "approve":
+                return _confirmations_approve(args, config)
+            if args.conf_command == "reject":
+                return _confirmations_reject(args, config)
         parser.error(f"unknown command: {args.command}")
     except TaskValidationError as exc:
         print(str(exc), file=sys.stderr)
         for issue in exc.issues:
             print(f"  {issue.render()}", file=sys.stderr)
         return 2
+    except ConfirmationError as exc:
+        print(f"CONFIRMATION REJECTED: {exc.message}", file=sys.stderr)
+        return 3
     except (BotError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

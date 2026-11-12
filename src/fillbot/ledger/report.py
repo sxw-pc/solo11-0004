@@ -33,6 +33,8 @@ def build_summary(ledger: Ledger, run_id: str) -> RunSummary:
         [task.receipt_no for task in tasks if task.receipt_no],
         str(run["started_at"]),
         run["finished_at"],
+        counts.get("abandoned", 0),
+        counts.get("awaiting_confirmation", 0),
     )
 def export_summary(ledger: Ledger, run_id: str, output_dir: str | Path) -> tuple[Path, Path]:
     summary = build_summary(ledger, run_id)
@@ -45,6 +47,8 @@ def export_summary(ledger: Ledger, run_id: str, output_dir: str | Path) -> tuple
         ("succeeded", summary.succeeded),
         ("failed", summary.failed),
         ("skipped", summary.skipped),
+        ("abandoned", summary.abandoned),
+        ("awaiting_confirmation", summary.awaiting_confirmation),
         ("average_duration_ms", summary.average_duration_ms),
         *((f"failure_reason:{key}", count) for key, count in summary.failure_reasons.items()),
         ("receipts", ";".join(summary.receipts)),
@@ -59,7 +63,7 @@ def render_summary(ledger: Ledger, run_id: str) -> str:
     lines = [
         f"run:      {summary.run_id}",
         f"status:   {summary.status}",
-        f"tasks:    {summary.tasks_total} total, {summary.succeeded} succeeded, {summary.failed} failed, {summary.skipped} skipped",
+        f"tasks:    {summary.tasks_total} total, {summary.succeeded} succeeded, {summary.failed} failed, {summary.skipped} skipped, {summary.abandoned} human-abandoned, {summary.awaiting_confirmation} awaiting confirmation",
         f"avg ms:   {summary.average_duration_ms}",
         f"reasons:  {summary.failure_reasons or '{}'}",
         f"receipts: {', '.join(summary.receipts) or '-'}",
@@ -71,6 +75,10 @@ def render_summary(ledger: Ledger, run_id: str) -> str:
         lines.append("task detail:")
         for task in tasks:
             suffix = f" receipt={task.receipt_no}" if task.receipt_no else ""
+            if task.status == "abandoned":
+                detail = f" {task.error_message}" if task.error_message else ""
+                lines.append(f"  {task.task_id} [abandoned] human-abandoned{detail}")
+                continue
             error = f" error={task.error_class}:{task.error_message}" if task.error_class else ""
             lines.append(f"  {task.task_id} [{task.status}] {task.duration_ms}ms{suffix}{error}")
     return "\n".join(lines)

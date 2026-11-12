@@ -18,16 +18,20 @@ class TaskStatus(str, Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
     DRY_RUN = "dry_run"
+    AWAITING_CONFIRMATION = "awaiting_confirmation"
+    ABANDONED = "abandoned"
 class RunStatus(str, Enum):
     RUNNING = "running"
     SUCCESS = "success"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
     DRY_RUN = "dry_run"
+    AWAITING_CONFIRMATION = "awaiting_confirmation"
 class StepStatus(str, Enum):
     OK = "ok"
     FAILED = "failed"
     SKIPPED = "skipped"
+    AWAITING_CONFIRMATION = "awaiting_confirmation"
 @dataclass(frozen=True)
 class TaskRecord:
     task_id: str
@@ -70,6 +74,7 @@ class EngineResult:
     error_class: str | None = None
     receipt_no: str | None = None
     attempts: int = 1
+    gate_step_index: int | None = None
 @dataclass
 class RunRecord:
     run_id: str
@@ -80,12 +85,27 @@ class RunRecord:
     succeeded: int = 0
     failed: int = 0
     skipped: int = 0
+    abandoned: int = 0
     task_source: str = ""
     script_source: str = ""
     dry_run: bool = False
     base_url: str = ""
     evidence_dir: str = ""
     options: dict[str, Any] = field(default_factory=dict)
+@dataclass(frozen=True)
+class ConfirmationRecord:
+    confirmation_id: str
+    run_id: str
+    task_id: str
+    biz_key: str
+    status: str
+    gate_step_index: int
+    token_hint: str
+    evidence_dir: str = ""
+    created_at: str = ""
+    decided_at: str | None = None
+    decided_by: str | None = None
+    decision_note: str | None = None
 @dataclass
 class TaskSummary:
     task_id: str
@@ -110,5 +130,7 @@ class RunSummary:
     receipts: list[str]
     started_at: str
     finished_at: str | None = None
+    abandoned: int = 0
+    awaiting_confirmation: int = 0
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -60,3 +60,6 @@ class UnregisteredActionError(ScriptError):
     pass
 class DryRunStop(Exception):
     pass
+class ConfirmationError(BotError):
+    """Rejected human-confirmation-gate operation (bad or spent token)."""
+    category = ErrorClass.SCRIPT

@@ -29,7 +29,7 @@ def test_ledger_dao_and_duplicate_receipt(tmp_path: Path) -> None:
     ledger = Ledger(tmp_path / "ledger.db")
     with sqlite3.connect(ledger.path) as connection:
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
-    assert tables == {"runs", "tasks", "steps"}
+    assert tables == {"runs", "tasks", "steps", "confirmations", "confirmation_events"}
     ledger.create_run(_run())
     assert ledger.latest_run_id() == "R-1" and ledger.get_run("missing") is None
     ledger.start_task("R-1", _task("T-1", "C1:q"), iso_now(), "/evidence/T-1")

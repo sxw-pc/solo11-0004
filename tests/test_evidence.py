@@ -43,3 +43,16 @@ def test_retention_and_keep_zero(tmp_path: Path) -> None:
     assert not old.parent.exists() and (new / "step-01.html").is_file() and ledger.get_run("old-run") is not None
     assert EvidenceStore(tmp_path / "none", keep_runs=0).cleanup() == []
     assert EvidenceStore(base, keep_runs=1).cleanup(0) == ["new-run"] and not list(base.iterdir())
+def test_cleanup_protects_runs_awaiting_confirmation(tmp_path: Path) -> None:
+    base = tmp_path / "evidence"
+    old, waiting, new = (base / name / "task" for name in ("old-run", "waiting-run", "new-run"))
+    for directory in (old, waiting, new):
+        directory.mkdir(parents=True)
+        (directory / "confirmation-snapshot.html").write_text("snapshot")
+    old_time = time.time() - 1000
+    os.utime(old.parent, (old_time, old_time))
+    os.utime(old, (old_time, old_time))
+    removed = EvidenceStore(base, keep_runs=1).cleanup(protect=["waiting-run"])
+    assert removed == ["old-run"]
+    assert (waiting / "confirmation-snapshot.html").is_file()
+    assert not old.parent.exists() and new.parent.is_dir()

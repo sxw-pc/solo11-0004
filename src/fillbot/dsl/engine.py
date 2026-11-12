@@ -25,18 +25,23 @@ class DSLExecutor:
         snapshot_cb: Callable[[Step, Page, StepStatus], None] | None = None,
         action_log_cb: Callable[[dict[str, Any]], None] | None = None,
         retry_cb: Callable[[Step, int, BotError, float], None] | None = None,
+        gate_cb: Callable[[Step], None] | None = None,
+        gate_mode: str = "pause",
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.script, self.browser = script, browser
         self.task_context, self.run_id = dict(task_context), run_id
         self.env = dict(os.environ if env is None else env)
         self.default_retry = default_retry or RetryPolicy()
-        self.snapshot_cb, self.action_log_cb, self.retry_cb, self.sleeper = (
+        self.snapshot_cb, self.action_log_cb, self.retry_cb, self.gate_cb = (
             snapshot_cb,
             action_log_cb,
             retry_cb,
-            sleeper,
+            gate_cb,
         )
+        self.gate_mode, self.sleeper = gate_mode, sleeper
+        if gate_mode not in {"pause", "approve"}:
+            raise ScriptError(f"unknown gate mode: {gate_mode}")
         self.variables: dict[str, Any] = {}
     def _lookup(self, expression: str, step_no: int) -> Any:
         parts = expression.split(".")
@@ -171,6 +176,17 @@ class DSLExecutor:
             if dry_run and step.final:
                 results.append(self._record(step, StepStatus.SKIPPED, started_at, clock, 0))
                 return EngineResult(TaskStatus.DRY_RUN, dict(self.variables), results)
+            if step.require_confirmation and self.gate_mode == "pause":
+                gate_result = self._record(step, StepStatus.AWAITING_CONFIRMATION, started_at, clock, 0)
+                results.append(gate_result)
+                if self.gate_cb is not None:
+                    self.gate_cb(step)
+                return EngineResult(
+                    TaskStatus.AWAITING_CONFIRMATION,
+                    dict(self.variables),
+                    results,
+                    gate_step_index=step.index,
+                )
             try:
                 status, _, attempts = self._run_step(step)
             except BotError as caught:

@@ -87,6 +87,37 @@ def test_step_validation_errors(step: dict, fragment: str) -> None:
 def test_retry_validation(retry: object, fragment: str) -> None:
     with pytest.raises(ScriptError, match=fragment):
         validate_script(_script({"action": "click", "selector": "#a", "retry": retry}))
+def test_require_confirmation_validation() -> None:
+    gated = validate_script(
+        _script(
+            {"action": "open", "url": "http://x"},
+            {"action": "click", "selector": "#go", "final": True, "require_confirmation": True},
+        )
+    )
+    assert gated.steps[1].require_confirmation is True
+    bad_cases = [
+        ([{"action": "click", "selector": "#go", "require_confirmation": True}], "final"),
+        ([{"action": "fill", "selector": "#a", "value": "x", "final": True, "require_confirmation": True}], "only valid"),
+        ([{"action": "click", "selector": "#go", "final": True, "require_confirmation": "yes"}], "boolean"),
+    ]
+    for steps, fragment in bad_cases:
+        with pytest.raises(ScriptError, match=fragment):
+            validate_script(_script(*steps))
+    with pytest.raises(ScriptError, match="only one require_confirmation"):
+        validate_script(
+            _script(
+                {"action": "click", "selector": "#a", "final": True, "require_confirmation": True},
+                {"action": "click", "selector": "#b", "final": True, "require_confirmation": True},
+            )
+        )
+    # Unmarked scripts parse exactly as before.
+    plain = validate_script(_script({"action": "click", "selector": "#go", "final": True}))
+    assert plain.steps[0].require_confirmation is False
+def test_gated_example_script_loads() -> None:
+    script = load_script(ROOT / "scripts" / "quarterly_report_gated.yaml")
+    assert script.name == "quarterly-report-gated" and len(script.steps) == 29
+    gate = next(step for step in script.steps if step.require_confirmation)
+    assert gate.final is True and gate.action == "click"
 def test_load_script_file_errors(tmp_path: Path) -> None:
     with pytest.raises(ScriptError, match="not found"):
         load_script(tmp_path / "none.yaml")

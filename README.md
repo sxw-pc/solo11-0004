@@ -25,6 +25,11 @@ python -m fillbot run --tasks tasks/example_batch.json --script scripts/quarterl
 python -m fillbot run --tasks tasks/example_batch.json --script scripts/quarterly_report.yaml --dry-run
 python -m fillbot resume <run_id> --config configs/bot.example.yaml
 python -m fillbot report <run_id> --config configs/bot.example.yaml
+# 人工确认门（高敏表单）：门点暂停 -> 人过目 -> 凭一次性令牌批准/拒绝
+python -m fillbot run --tasks tasks/example_batch.json --script scripts/quarterly_report_gated.yaml
+python -m fillbot confirmations list --config configs/bot.example.yaml
+python -m fillbot confirmations approve --token <token> --tasks <tasks> --script <script>   # --token 可重复实现批量批准
+python -m fillbot confirmations reject  --token <token> --tasks <tasks> --note "数据不符"
 ```
 `validate` 完全离线，仅检查任务与脚本；`run` 默认串行执行。mock 账号（虚构）：`parkco-b / mock-only-beta`（C002，正常）、`parkco-c / mock-only-gamma`（C003，可注入提交故障）。
 ## 架构
@@ -72,7 +77,7 @@ T-9002,C002:2025-Q1,attachments/quarterly-notes.pdf,C002,2025-Q1
 | `select` | `value` | 按可见文本或 value 选择下拉项 |
 | `check` | `checked`（默认 true） | 勾选/取消复选框 |
 | `upload` | `path` | multipart 上传本地文件，必须存在 |
-| `click` | — | 提交所在表单或访问链接，沿用当前会话 |
+| `click` | — | 提交所在表单或访问链接，沿用当前会话；`final: true` 标记提交步骤，可再叠加 `require_confirmation: true` 加入人工确认门 |
 | `wait` | `seconds` | 显式等待，≤300 秒 |
 | `assert_text` | `text`、可选定位器 | 页内/元素内必须包含文本 |
 | `assert_status` | `status`（100–599） | 断言 HTTP 状态码 |
@@ -105,7 +110,20 @@ steps:
 | `runs_dir` / `FILLBOT_RUNS_DIR` | `runs` | run.log 与汇总目录 |
 | `mask_fields` | password/passwd/secret/token/csrf_token | 证据脱敏字段 |
 ## 错误、重试与状态
-错误类别：`NETWORK`、`SERVER`（均含 429/5xx）、`CLIENT`（4xx）、`ASSERT`、`SCRIPT`。只有 NETWORK/SERVER 自动重试；`Retry-After` 优先，其次指数退避 + 抖动。任务状态：`pending → running → success|failed|skipped|dry_run`；运行状态：`running → success|failed|interrupted|dry_run`，`interrupted/failed` 可续跑。未捕获异常（含 Ctrl+C/SystemExit）会把运行标记为 `interrupted` 后继续抛出。
+错误类别：`NETWORK`、`SERVER`（均含 429/5xx）、`CLIENT`（4xx）、`ASSERT`、`SCRIPT`。只有 NETWORK/SERVER 自动重试；`Retry-After` 优先，其次指数退避 + 抖动。任务状态：`pending → running → success|failed|skipped|dry_run|awaiting_confirmation →（批准）running → success|failed /（拒绝）abandoned`；运行状态：`running → success|failed|interrupted|dry_run|awaiting_confirmation`，`interrupted/failed` 可续跑，`abandoned` 为人工放弃终态不参与重试。未捕获异常（含 Ctrl+C/SystemExit）会把运行标记为 `interrupted` 后继续抛出。
+## 提交前人工确认门
+高敏表单要求“机器填好、人过目后再提交”。在提交所在的 `final` 点击上叠加 `require_confirmation: true` 即可启用；**不标记的旧脚本行为与之前完全一致**（默认全自动，零感知）。每个脚本至多一个确认门。
+```yaml
+- {action: click, selector: "form#confirm-form button[type=submit]", final: true, require_confirmation: true}
+```
+生命周期与安全保证：
+1. **暂停即持久化**：执行到门点（提交点击之前）时，任务置为 `awaiting_confirmation` 并写入 SQLite；进程被 kill、隔天重启都能通过 `confirmations list` 找回。
+2. **脱敏快照与证据**：把确认页脱敏后存为证据目录下的 `confirmation-snapshot.html`，并写一份不含填写值的 `confirmation.json` 字段清单（密码/令牌等仍按 `mask_fields` 脱敏）。
+3. **一次性令牌**：暂停时生成 `secrets` 随机令牌，台账只存 SHA-256 哈希与短前缀，明文仅在运行输出中出现一次。`confirmations approve/reject --token` 凭令牌决策；令牌通过条件 UPDATE 原子消费，**错误令牌或已使用令牌一律拒绝（CLI 退出码 3）且写入审计**。
+4. **会话不挂起**：暂停时立即关闭浏览器会话（不持有 cookie 干等）。批准后用**全新会话**从第一步安全重放到门点再提交——门点点击在暂停期间从未执行过，因此重放只会产生**恰好一次**提交；服务端会话过期也不受影响。
+5. **拒绝即人工放弃终态**：拒绝后任务置为 `abandoned`（非失败），报表中单列 `human-abandoned`，`resume` 与后续重跑都不会把它当失败重试，且全程无提交。
+6. **批量批准**：`approve --token A --token B ...` 可逐条/批量批准，每个令牌仍只生效一次。
+任务状态新增 `awaiting_confirmation`、`abandoned`；运行状态新增 `awaiting_confirmation`。审计落在 `confirmation_events` 表（`paused/approved/rejected/invalid_token/spent_token`，含操作者、时间与备注）。旧台账文件首次打开时自动迁移（新增列与新表，历史数据保留）。
 ## 幂等、dry-run 与续跑
 - 幂等键为 `biz_key`：台账中已有成功记录时，新任务直接记 `skipped`，不发起提交。
 - 回执号必须匹配 `RCP-YYYYMMDD-NNNN` 且全局唯一（SQLite 部分唯一索引 + 运行时检查）。
@@ -113,7 +131,7 @@ steps:
 - `resume <run_id>` 从台账读取原任务/脚本路径，跳过 `success|skipped`，只执行余下任务；已成功的 `biz_key` 不会重复提交。
 ## 证据与台账
 证据位于 `evidence/<run_id>/<task_id>/`：每步 `step-NN.html`（密码、token、secret 字段及已知敏感值替换为 `***`）、`actions.jsonl`（动作、定位器、结果、耗时、错误，不含填写值）、成功提交后的 `receipt.html`。证据快照会强制保存，便于审计后复核；保留策略只清理超期运行目录，不动台账。
-SQLite 三张表：`runs`（来源、状态、计数、时间）、`tasks`（任务、业务键、回执、错误、证据目录）、`steps`（步骤、动作、状态、尝试次数）。汇总写到 `runs/<run_id>/summary.json` 与 `summary.csv`，包含成功/失败/跳过数、失败原因分布、平均耗时与回执列表。
+SQLite 五张表：`runs`（来源、状态、计数、时间，含 `abandoned`）、`tasks`（任务、业务键、回执、错误、证据目录）、`steps`（步骤、动作、状态、尝试次数）、`confirmations`（确认门、令牌哈希、决策，仅待确认状态每任务唯一）与 `confirmation_events`（暂停/批准/拒绝/无效或重用令牌的全量审计）。汇总写到 `runs/<run_id>/summary.json` 与 `summary.csv`，包含成功/失败/跳过/人工放弃/待确认数、失败原因分布、平均耗时与回执列表。
 ## 故障注入与 mock 站点
 `python -m fillbot mock-serve --chaos --chaos-seed 7 --chaos-rate 0.2 --delay-ms 50 --flaky-submit` 可启用确定性故障；也可用 `FILLBOT_CHAOS*` 环境变量。`--flaky-submit` 只让指定企业（默认 C003）首次提交返回 500，用于验证重试与证据。mock 站点含登录、三步填报、确认、提交、回执路由以及 `/healthz`、`/__mock/receipts` 辅助端点。
 ## 设计取舍
@@ -128,5 +146,5 @@ SQLite 三张表：`runs`（来源、状态、计数、时间）、`tasks`（任
 - 增加 JSON Schema 导出与编辑器补全，降低脚本编写门槛。
 - 支持可插拔的授权目标适配器和更细粒度的字段级重试。
 - 增加运行指标（Prometheus 文本格式）与证据加密归档。
-- 提供可选的并发执行器（按 biz_key 分区）与更完善的人工接管队列。
+- 提供可选的并发执行器（按 biz_key 分区）；人工接管队列已支持提交前确认门，后续可扩展到任意步骤的人工介入。
 - 持续补充离线契约测试；不计划加入验证码绕过、隐身或未授权采集能力。

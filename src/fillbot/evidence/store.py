@@ -49,14 +49,18 @@ class EvidenceStore:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
         return path
-    def cleanup(self, keep: int | None = None) -> list[str]:
+    def cleanup(self, keep: int | None = None, protect: Iterable[str] = ()) -> list[str]:
         retain = self.keep_runs if keep is None else max(0, keep)
+        protected = {safe_component(run_id) for run_id in protect}
         if not self.base_dir.is_dir():
             return []
         candidates = [item for item in self.base_dir.iterdir() if item.is_dir()]
         candidates.sort(key=lambda item: item.stat().st_mtime, reverse=True)
         removed = []
         for directory in candidates[retain:]:
+            # Runs with an open human-confirmation gate keep their review evidence.
+            if directory.name in protected:
+                continue
             shutil.rmtree(directory, ignore_errors=True)
             removed.append(directory.name)
         return removed

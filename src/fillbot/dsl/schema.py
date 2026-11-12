@@ -30,7 +30,7 @@ ACTION_REGISTRY = {
     "extract": ActionSpec(frozenset({"save_as"}), frozenset({"attr"}), locator=True),
     "set_var": ActionSpec(frozenset({"name", "value"})),
 }
-COMMON_KEYS = frozenset({"on_error", "retry", "timeout", "final"})
+COMMON_KEYS = frozenset({"on_error", "retry", "timeout", "final", "require_confirmation"})
 ON_ERROR_VALUES = frozenset({"fail", "skip", "continue"})
 @dataclass(frozen=True)
 class RetrySpec:
@@ -48,6 +48,7 @@ class Step:
     retry_explicit: bool = False
     timeout: float | None = None
     final: bool = False
+    require_confirmation: bool = False
 @dataclass(frozen=True)
 class Script:
     name: str
@@ -149,6 +150,11 @@ def _parse_step(raw: Any, step_no: int) -> Step:
         raise ScriptError(f"step {step_no}: final must be a boolean")
     if final and action != "click":
         raise ScriptError(f"step {step_no}: final is only valid on click")
+    require_confirmation = raw.get("require_confirmation", False)
+    if not isinstance(require_confirmation, bool):
+        raise ScriptError(f"step {step_no}: require_confirmation must be a boolean")
+    if require_confirmation and not final:
+        raise ScriptError(f"step {step_no}: require_confirmation is only valid on a final click (final: true)")
     return Step(
         step_no,
         action,
@@ -159,6 +165,7 @@ def _parse_step(raw: Any, step_no: int) -> Step:
         "retry" in raw,
         float(timeout) if timeout is not None else None,
         final,
+        require_confirmation,
     )
 def validate_script(data: Mapping[str, Any]) -> Script:
     if not isinstance(data, Mapping):
@@ -175,6 +182,11 @@ def validate_script(data: Mapping[str, Any]) -> Script:
     if not isinstance(raw_steps, list) or not raw_steps:
         raise ScriptError("script.steps must be a non-empty list")
     steps = tuple(_parse_step(item, index) for index, item in enumerate(raw_steps, 1))
+    gates = [step.index for step in steps if step.require_confirmation]
+    if len(gates) > 1:
+        raise ScriptError(
+            f"only one require_confirmation step is allowed per script; found steps {', '.join(map(str, gates))}"
+        )
     return Script(name.strip(), 1, steps, str(data.get("description", "")))
 def load_script(path: str | Path) -> Script:
     script_path = Path(path)
