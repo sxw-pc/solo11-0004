@@ -1,0 +1,23 @@
+[
+  {
+    "task_id": "T-2002",
+    "biz_key": "C002:2025-Q4",
+    "attachments": [
+      "tasks/attachments/quarterly-notes.pdf"
+    ],
+    "payload": {
+      "username": "parkco-b",
+      "password": "mock-only-beta",
+      "company_id": "C002",
+      "company_name": "青岚谷生态科技（虚构）",
+      "period": "2025-Q4",
+      "contact_name": "林小岚（虚构）",
+      "report_date": "2025-11-10",
+      "electricity": 12800.5,
+      "water": 340.2,
+      "gas": 88.1,
+      "employees": 42,
+      "hires": 3
+    }
+  }
+]

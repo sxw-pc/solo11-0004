@@ -1,10 +1,16 @@
-"""Command-line interface: mock-serve, validate, run, resume, report."""
+"""Command-line interface: mock-serve, validate, run, resume, report, deps."""
 from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
 from typing import Sequence
 from fillbot.config import BotConfig, load_config
+from fillbot.deps.config import DepConfig
+from fillbot.deps.graph import load_plan
+from fillbot.deps.models import CycleDetectedError, DependencyError
+from fillbot.deps.orchestrator import Orchestrator
+from fillbot.deps.report import print_workflow
+from fillbot.deps.store import DependencyStore
 from fillbot.dsl.schema import load_script
 from fillbot.errors import BotError, TaskValidationError
 from fillbot.intake import load_and_validate_tasks
@@ -40,6 +46,23 @@ def _parser() -> argparse.ArgumentParser:
     resume.add_argument("--base-url")
     report = sub.add_parser("report", parents=[common], help="print ledger summary")
     report.add_argument("run_id")
+
+    # Opt-in cross-batch dependency orchestration; separate subcommand group so the
+    # existing single-batch run/resume entry points stay byte-for-byte unchanged.
+    deps = sub.add_parser("deps", help="cross-batch dependency orchestration")
+    deps_sub = deps.add_subparsers(dest="deps_command", required=True)
+    deps_validate = deps_sub.add_parser("validate", parents=[common], help="validate a dependency plan offline")
+    deps_validate.add_argument("--plan", required=True, help="dependency YAML file")
+    deps_run = deps_sub.add_parser("run", parents=[common], help="run batches according to a dependency plan")
+    deps_run.add_argument("--plan", required=True, help="dependency YAML file")
+    deps_run.add_argument("--deps-config", help="optional dependency-layer config (store path, timeouts)")
+    deps_run.add_argument("--dry-run", action="store_true")
+    deps_resume = deps_sub.add_parser("resume", parents=[common], help="resume an interrupted dependency workflow")
+    deps_resume.add_argument("workflow_id", nargs="?")
+    deps_resume.add_argument("--deps-config", help="optional dependency-layer config (store path, timeouts)")
+    deps_status = deps_sub.add_parser("status", parents=[common], help="show workflow/batch dependency state")
+    deps_status.add_argument("workflow_id", nargs="?")
+    deps_status.add_argument("--deps-config", help="optional dependency-layer config (store path, timeouts)")
     return parser
 def _config(args: argparse.Namespace) -> BotConfig:
     overrides: dict[str, object] = {}
@@ -90,6 +113,68 @@ def _resume(args: argparse.Namespace, config: BotConfig) -> int:
 def _report(args: argparse.Namespace, config: BotConfig) -> int:
     print_summary(Ledger(config.ledger_path), args.run_id)
     return 0
+
+
+def _dep_config(args: argparse.Namespace) -> DepConfig:
+    raw: dict[str, object] = {}
+    deps_config_path = getattr(args, "deps_config", None)
+    if deps_config_path:
+        import yaml
+
+        path = Path(deps_config_path)
+        if not path.is_file():
+            raise BotError(f"dependency config file not found: {path}")
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if not isinstance(loaded, dict):
+            raise BotError("dependency config must be a YAML mapping")
+        raw = loaded
+    return DepConfig.from_mapping(raw)
+
+
+def _deps_validate(args: argparse.Namespace) -> int:
+    plan = load_plan(args.plan)
+    print(
+        f"OK: dependency plan {plan.name!r} with {len(plan.batches)} batch(es); "
+        "no cycles, no network requests were made"
+    )
+    for spec in plan.batches:
+        edge = f" depends_on={list(spec.depends_on)}" if spec.depends_on else " (root)"
+        print(f"  - {spec.name}{edge}")
+    return 0
+
+
+def _deps_run(args: argparse.Namespace, config: BotConfig) -> int:
+    plan = load_plan(args.plan)
+    dep_config = _dep_config(args)
+    store = DependencyStore(dep_config.store_path)
+    orchestrator = Orchestrator(config, store)
+    record = orchestrator.run(plan, source=str(Path(args.plan).resolve()), dry_run=args.dry_run)
+    print_workflow(store, record.workflow_id)
+    print(f"summary: workflow {record.workflow_id} status={record.status.value}")
+    return 0 if record.status.value == "success" else 1
+
+
+def _deps_resume(args: argparse.Namespace, config: BotConfig) -> int:
+    dep_config = _dep_config(args)
+    store = DependencyStore(dep_config.store_path)
+    workflow_id = args.workflow_id or store.latest_workflow_id()
+    if not workflow_id:
+        raise BotError("no dependency workflow found to resume")
+    orchestrator = Orchestrator(config, store)
+    record = orchestrator.resume(workflow_id)
+    print_workflow(store, record.workflow_id)
+    print(f"summary: workflow {record.workflow_id} status={record.status.value}")
+    return 0 if record.status.value == "success" else 1
+
+
+def _deps_status(args: argparse.Namespace) -> int:
+    dep_config = _dep_config(args)
+    store = DependencyStore(dep_config.store_path)
+    workflow_id = args.workflow_id or store.latest_workflow_id()
+    if not workflow_id:
+        raise BotError("no dependency workflow found")
+    print_workflow(store, workflow_id)
+    return 0
 def _mock_serve(args: argparse.Namespace) -> int:
     if not 1 <= args.port <= 65535:
         raise BotError("--port must be between 1 and 65535")
@@ -120,6 +205,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _mock_serve(args)
         if args.command == "validate":
             return _validate(args)
+        if args.command == "deps":
+            if args.deps_command == "validate":
+                return _deps_validate(args)
+            config = _config(args)
+            if args.deps_command == "run":
+                return _deps_run(args, config)
+            if args.deps_command == "resume":
+                return _deps_resume(args, config)
+            if args.deps_command == "status":
+                return _deps_status(args)
+            parser.error(f"unknown deps command: {args.deps_command}")
         config = _config(args)
         if args.command == "run":
             return _run(args, config)
@@ -133,7 +229,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         for issue in exc.issues:
             print(f"  {issue.render()}", file=sys.stderr)
         return 2
-    except (BotError, OSError) as exc:
+    except CycleDetectedError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        for cycle in exc.cycles:
+            print("  cycle: " + " -> ".join([*cycle, cycle[0]]), file=sys.stderr)
+        return 2
+    except (DependencyError, BotError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     return 2

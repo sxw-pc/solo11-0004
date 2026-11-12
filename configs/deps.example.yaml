@@ -1,0 +1,17 @@
+# Dependency-orchestration layer configuration (opt-in).
+# Used only by `fillbot deps ...` via --deps-config; the main bot config is untouched.
+#
+# Separate SQLite database from the task ledger (data/ledger.db) so that enabling
+# dependency orchestration never modifies the existing ledger schema.
+store_path: data/dependencies.db
+
+# How often the orchestrator re-checks whether prerequisites are satisfied.
+# Suspended batches hold no browser/network/worker between ticks: each tick is one
+# cheap SQLite read. Keep this >= a fraction of a second.
+poll_interval_seconds: 1.0
+
+# Default maximum wait (seconds) for a batch whose prerequisites are not yet all
+# successful. A batch that exceeds its deadline is marked `timeout` and its
+# dependents are cascade-blocked. Per-batch `timeout_seconds` in the plan overrides
+# this. Leave unset/blank for no timeout.
+default_timeout_seconds: 3600

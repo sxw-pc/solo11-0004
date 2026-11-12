@@ -122,11 +122,53 @@ SQLite 三张表：`runs`（来源、状态、计数、时间）、`tasks`（任
 - **SQLite 作为唯一事实源**：便于恢复和审计；证据文件仅作旁证。唯一的回执索引是最后一道防线。
 - **严格契约**：未知配置、动作、参数、变量一律报错，避免“静默成功”造成假报送。
 - **mock 先行**：默认只允许回环目标，所有示例和测试在无外网环境可复现。
+## 跨批次依赖编排（opt-in）
+当不同业务条线的批次存在先后依赖（例如能耗类填报必须等核算类批次全部成功后才能启动）时，可用独立的依赖编排模块自动调度，无需再人工盯守。该能力完全增量提供：**不改动现有任务文件格式、`run`/`resume`/`validate` 入口与串行 `Runner`**，不写依赖计划时一切行为不变。
+### 关键取舍：显式声明，不自动推导
+依赖关系只接受**显式 YAML 声明**，不按企业编号/季度等命名规律自动猜测业务关联。填报是写入型动作，隐式推导一旦猜错就会造成“前置未完成却启动下游”的不可逆误报送；显式规则可离线校验、可评审、可审计，与本项目“宁可在提交前失败，也不在不确定状态下重复写入”的原则一致。
+```yaml
+# tasks/deps/quarterly_workflow.yaml
+name: quarterly-reporting
+default_timeout_seconds: 3600      # 等待前置的全局超时，可被单批次覆盖
+poll_interval_seconds: 1.0         # 挂起批次的状态检查节拍
+batches:
+  - name: accounting               # 根批次，无 depends_on，立即调度
+    tasks: tasks/deps/accounting_batch.json
+    script: scripts/quarterly_report.yaml
+  - name: energy
+    tasks: tasks/deps/energy_batch.json
+    script: scripts/quarterly_report.yaml
+    depends_on: [accounting]       # 必须等 accounting 成功
+    timeout_seconds: 1800
+  - name: summary
+    tasks: tasks/deps/summary_batch.json
+    script: scripts/quarterly_report.yaml
+    depends_on: [energy]
+```
+每个 batch 复用既有的任务清单与 DSL 脚本，支持 `depends_on` 多个前置（菱形依赖）与任意深度链路。
+### 命令
+```bash
+python -m fillbot deps validate --plan tasks/deps/quarterly_workflow.yaml      # 离线校验，含环检测
+python -m fillbot deps run      --plan <plan.yaml> --config <bot.yaml> --deps-config configs/deps.example.yaml
+python -m fillbot deps resume   [workflow_id] --config <bot.yaml> --deps-config <deps.yaml>
+python -m fillbot deps status   [workflow_id] --deps-config <deps.yaml>
+```
+依赖层配置（`--deps-config`，见 `configs/deps.example.yaml`）与主配置分离，也可用环境变量 `FILLBOT_DEPS_STORE` / `FILLBOT_DEPS_POLL_INTERVAL` / `FILLBOT_DEPS_TIMEOUT` 覆盖。
+### 保障机制
+| 诉求 | 实现 |
+| --- | --- |
+| 循环依赖立刻告警 | 加载计划时三色 DFS 环检测，输出完整闭环路径（如 `a -> c -> b -> a`）并以退出码 2 失败，不启动任何批次 |
+| 前置失败级联阻断 | 前置 `failed`/`timeout`/`blocked` 时，所有仍在等待的传递下游自动置为终态 `blocked`，记录 `blocked_by` 审计链，绝不误执行 |
+| 等待不占执行资源 | 挂起批次在独立 SQLite 库中仅为一行状态，不构建浏览器/网络/工作线程；每个节拍只做一次廉价的 SQLite 状态检查，前置满足才创建 `Runner` |
+| 超时自动终止 | 以批次**开始等待**的时间为基准计算 deadline（前置运行耗时不占用下游预算），超时置 `timeout` 并级联阻断，附明确原因 |
+| 重启自动恢复 | 所有调度决策先落库再执行；批次以预分配的 `run_id` 原子写入 `(running, run_id)`，重启后孤儿 running 批次回退为挂起并经原有 `Runner.resume` 精确续跑，挂起批次继续等待 |
+| 无依赖任务零影响 | 依赖状态存于独立 `dependencies.db`，与任务台账 `ledger.db` 物理隔离；原有 `run`/`resume` 与单批次逻辑完全不变 |
+批次状态机：`pending → suspended → ready → running → success|failed`，另有终态 `blocked`（级联）与 `timeout`（超时）。`deps status` 以图形符号与原因文本展示每个批次的实时状态。
 ## 测试与离线保证
 测试使用 pytest + pytest-cov；`tests/conftest.py` 的 autouse fixture 替换 `socket.socket.connect`，仅允许 `127.0.0.1`，任何外连立即失败。覆盖 intake、DSL、浏览器适配器、mock 站点、台账/报表、重试/状态机、证据脱敏、CLI 与端到端批次；门槛 85%。
 ## 路线图
 - 增加 JSON Schema 导出与编辑器补全，降低脚本编写门槛。
 - 支持可插拔的授权目标适配器和更细粒度的字段级重试。
 - 增加运行指标（Prometheus 文本格式）与证据加密归档。
-- 提供可选的并发执行器（按 biz_key 分区）与更完善的人工接管队列。
+- 提供可选的并发执行器（按 biz_key 分区，与现有依赖编排协同）与更完善的人工接管队列。
 - 持续补充离线契约测试；不计划加入验证码绕过、隐身或未授权采集能力。

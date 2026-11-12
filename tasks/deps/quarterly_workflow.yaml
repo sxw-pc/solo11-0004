@@ -1,0 +1,29 @@
+# 跨批次依赖编排示例（显式声明，绝不自动猜测业务关联）。
+# 场景：能耗类填报必须等核算类批次全部成功后才能启动；汇总又依赖能耗批次。
+# 用法：
+#   python -m fillbot deps validate --plan tasks/deps/quarterly_workflow.yaml
+#   python -m fillbot deps run      --plan tasks/deps/quarterly_workflow.yaml --config configs/bot.example.yaml
+#
+# 每个 batch 复用现有的任务清单与 DSL 脚本，任务文件格式与运行入口均无需改动。
+name: quarterly-reporting
+# 依赖等待的全局默认超时（秒）；可被单个 batch 的 timeout_seconds 覆盖。
+# 超时未满足依赖的批次会被自动置为 timeout 并级联阻断其下游。
+default_timeout_seconds: 3600
+# 事件驱动轮询节拍：挂起批次不占用浏览器/网络/工作线程，只按此间隔做一次廉价的 SQLite 状态检查。
+poll_interval_seconds: 1.0
+batches:
+  - name: accounting
+    tasks: tasks/deps/accounting_batch.json
+    script: scripts/quarterly_report.yaml
+    # 无 depends_on：根批次，可立即调度。
+  - name: energy
+    tasks: tasks/deps/energy_batch.json
+    script: scripts/quarterly_report.yaml
+    depends_on:
+      - accounting
+    timeout_seconds: 1800
+  - name: summary
+    tasks: tasks/deps/summary_batch.json
+    script: scripts/quarterly_report.yaml
+    depends_on:
+      - energy
