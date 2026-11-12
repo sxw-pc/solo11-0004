@@ -20,6 +20,13 @@ _DEFAULTS: dict[str, Any] = {
     "ledger_path": "data/ledger.db",
     "runs_dir": "runs",
     "mask_fields": ["password", "passwd", "secret", "token", "csrf_token"],
+    "session_reuse": True,
+    "session_ttl_seconds": 1500.0,
+    "session_idle_seconds": 600.0,
+    "session_login_path": "/login",
+    "session_home_path": "/",
+    "session_max_invalidations": 3,
+    "session_acquire_timeout_seconds": 300.0,
 }
 _ENV_MAP = {
     "FILLBOT_BASE_URL": "base_url",
@@ -34,6 +41,13 @@ _ENV_MAP = {
     "FILLBOT_EVIDENCE_DIR": "evidence_dir",
     "FILLBOT_LEDGER_PATH": "ledger_path",
     "FILLBOT_RUNS_DIR": "runs_dir",
+    "FILLBOT_SESSION_REUSE": "session_reuse",
+    "FILLBOT_SESSION_TTL_SECONDS": "session_ttl_seconds",
+    "FILLBOT_SESSION_IDLE_SECONDS": "session_idle_seconds",
+    "FILLBOT_SESSION_LOGIN_PATH": "session_login_path",
+    "FILLBOT_SESSION_HOME_PATH": "session_home_path",
+    "FILLBOT_SESSION_MAX_INVALIDATIONS": "session_max_invalidations",
+    "FILLBOT_SESSION_ACQUIRE_TIMEOUT_SECONDS": "session_acquire_timeout_seconds",
 }
 def _bool(value: Any, name: str) -> bool:
     if isinstance(value, bool):
@@ -57,14 +71,21 @@ def _num(value: Any, name: str, cast: type, minimum: float) -> float | int:
 def _coerce(key: str, value: Any) -> Any:
     if key in {"timeout_seconds", "backoff_base_seconds", "backoff_max_seconds"}:
         return _num(value, key, float, 0.01)
-    if key in {"max_retries", "evidence_keep_runs"}:
-        return _num(value, key, int, 0)
+    if key in {"session_ttl_seconds", "session_idle_seconds", "session_acquire_timeout_seconds"}:
+        return _num(value, key, float, 0.01)
+    if key in {"max_retries", "evidence_keep_runs", "session_max_invalidations"}:
+        return _num(value, key, int, 1 if key == "session_max_invalidations" else 0)
     if key == "rate_limit_per_minute":
         return _num(value, key, int, 1)
-    if key in {"follow_redirects", "jitter"}:
+    if key in {"follow_redirects", "jitter", "session_reuse"}:
         return _bool(value, key)
     if key in {"evidence_dir", "ledger_path", "runs_dir"}:
         return str(value)
+    if key in {"session_login_path", "session_home_path"}:
+        text = str(value).strip()
+        if not text.startswith("/"):
+            raise ConfigError(f"{key} must be an absolute path starting with '/', got {text!r}")
+        return text
     if key == "mask_fields":
         if not isinstance(value, (list, tuple)) or not all(isinstance(item, str) for item in value):
             raise ConfigError("mask_fields must be a list of strings")
@@ -90,6 +111,13 @@ class BotConfig:
     ledger_path: Path = field(default_factory=lambda: Path("data/ledger.db"))
     runs_dir: Path = field(default_factory=lambda: Path("runs"))
     mask_fields: tuple[str, ...] = ("password", "passwd", "secret", "token", "csrf_token")
+    session_reuse: bool = True
+    session_ttl_seconds: float = 1500.0
+    session_idle_seconds: float = 600.0
+    session_login_path: str = "/login"
+    session_home_path: str = "/"
+    session_max_invalidations: int = 3
+    session_acquire_timeout_seconds: float = 300.0
     def with_overrides(self, **overrides: Any) -> "BotConfig":
         clean = {key: value for key, value in overrides.items() if value is not None}
         return replace(self, **clean) if clean else self

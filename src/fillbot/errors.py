@@ -8,6 +8,7 @@ class ErrorClass(str, Enum):
     CLIENT = "CLIENT"
     ASSERT = "ASSERT"
     SCRIPT = "SCRIPT"
+    SESSION = "SESSION"
 RETRYABLE_CLASSES = frozenset({ErrorClass.NETWORK, ErrorClass.SERVER})
 class BotError(Exception):
     category = ErrorClass.SCRIPT
@@ -48,6 +49,10 @@ class AssertionFailure(BotError):
     category = ErrorClass.ASSERT
 class ScriptError(BotError):
     category = ErrorClass.SCRIPT
+class SessionError(BotError):
+    """Session-pool failures: acquisition, renewal and revocation. Not retryable."""
+
+    category = ErrorClass.SESSION
 class TaskValidationError(BotError):
     def __init__(self, message: str, issues: list[Any] | None = None) -> None:
         super().__init__(message, details={"issues": issues or []})

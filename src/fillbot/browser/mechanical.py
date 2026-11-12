@@ -143,7 +143,10 @@ class MechanicalBrowser(BrowserSession):
         method = str(trigger.get("formmethod") or form.get("method") or "GET").upper()
         action = str(trigger.get("formaction") or form.get("action") or "")
         return _Submission(locator, method, urljoin(self.page.url, action) if action else self.page.url, data, files)
-    def click(self, locator: Locator, *, timeout: float | None = None) -> Page:
+    def submission_url_for(self, locator: Locator) -> str:
+        """Resolve the URL a click would submit to, without sending any request."""
+        return self._prepare_form(locator).url
+    def click(self, locator: Locator, *, timeout: float | None = None, final: bool = False) -> Page:
         try:
             submission = self._prepare_form(locator)
         except ScriptError:

@@ -43,7 +43,7 @@ def action_upload(context: ActionContext, step: Step) -> None:
     context.browser.upload(step.locator, path)
 def action_click(context: ActionContext, step: Step) -> None:
     assert step.locator is not None
-    context.browser.click(step.locator, timeout=step.timeout)
+    context.browser.click(step.locator, timeout=step.timeout, final=step.final)
 def action_wait(context: ActionContext, step: Step) -> None:
     seconds = float(step.params["seconds"])
     if seconds > 300:
