@@ -72,7 +72,8 @@ def render_summary(ledger: Ledger, run_id: str) -> str:
         for task in tasks:
             suffix = f" receipt={task.receipt_no}" if task.receipt_no else ""
             error = f" error={task.error_class}:{task.error_message}" if task.error_class else ""
-            lines.append(f"  {task.task_id} [{task.status}] {task.duration_ms}ms{suffix}{error}")
+            evidence = f" evidence={task.evidence_dir}" if task.evidence_dir else ""
+            lines.append(f"  {task.task_id} [{task.status}] {task.duration_ms}ms{suffix}{error}{evidence}")
     return "\n".join(lines)
 def print_summary(ledger: Ledger, run_id: str, stream: TextIO | None = None) -> None:
     (stream or sys.stdout).write(render_summary(ledger, run_id) + "\n")

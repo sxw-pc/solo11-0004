@@ -1,4 +1,4 @@
-"""Command-line interface: mock-serve, validate, run, resume, report."""
+"""Command-line interface: mock-serve, validate, run, resume, report, cleanup, refs."""
 from __future__ import annotations
 import argparse
 import sys
@@ -7,6 +7,7 @@ from typing import Sequence
 from fillbot.config import BotConfig, load_config
 from fillbot.dsl.schema import load_script
 from fillbot.errors import BotError, TaskValidationError
+from fillbot.evidence.retention import REPORT_SOURCE, RetentionManager
 from fillbot.intake import load_and_validate_tasks
 from fillbot.ledger.db import Ledger
 from fillbot.ledger.report import print_summary
@@ -40,6 +41,18 @@ def _parser() -> argparse.ArgumentParser:
     resume.add_argument("--base-url")
     report = sub.add_parser("report", parents=[common], help="print ledger summary")
     report.add_argument("run_id")
+    cleanup = sub.add_parser("cleanup", parents=[common], help="reclaim unreachable evidence past the retention window")
+    cleanup.add_argument("--dry-run", action="store_true", help="report what would be reclaimed without deleting")
+    cleanup.add_argument("--retention-days", type=int, help="override evidence_retention_days")
+    refs = sub.add_parser("refs", parents=[common], help="query evidence references or pin them for a review report")
+    refs.add_argument("--run", dest="run_id")
+    refs.add_argument("--task", dest="task_id")
+    refs.add_argument("--biz-key")
+    refs.add_argument("--type", dest="evidence_type", help="snapshot | actions | receipt")
+    refs.add_argument("--source", help="ref source: run | report | ...")
+    refs.add_argument("--include-released", action="store_true", help="include released refs in the listing")
+    refs.add_argument("--pin", action="store_true", help="pin matching evidence so cleanup keeps it")
+    refs.add_argument("--unpin", action="store_true", help="release report pins matching the filters")
     return parser
 def _config(args: argparse.Namespace) -> BotConfig:
     overrides: dict[str, object] = {}
@@ -90,6 +103,60 @@ def _resume(args: argparse.Namespace, config: BotConfig) -> int:
 def _report(args: argparse.Namespace, config: BotConfig) -> int:
     print_summary(Ledger(config.ledger_path), args.run_id)
     return 0
+def _cleanup(args: argparse.Namespace, config: BotConfig) -> int:
+    retention_days = args.retention_days if args.retention_days is not None else config.evidence_retention_days
+    if retention_days < 0:
+        raise BotError("--retention-days must be >= 0")
+    manager = RetentionManager(Ledger(config.ledger_path), config.evidence_dir, retention_days=retention_days)
+    result = manager.cleanup(dry_run=args.dry_run)
+    mode = "dry-run" if result.dry_run else "execute"
+    print(f"cleanup [{mode}]: retention={result.retention_days}d backfilled_refs={result.backfilled_refs}")
+    verb = "would delete" if result.dry_run else "deleted"
+    for path in result.deleted_files:
+        print(f"  {verb} file: {path}")
+    for path in result.deleted_dirs:
+        print(f"  {verb} dir:  {path}")
+    for path, reason in result.kept:
+        print(f"  kept: {path} ({reason})")
+    for warning in result.warnings:
+        print(f"  WARNING: {warning}", file=sys.stderr)
+    print(
+        f"cleanup [{mode}]: files={len(result.deleted_files)} dirs={len(result.deleted_dirs)} "
+        f"released_refs={result.released_refs} kept={len(result.kept)} warnings={len(result.warnings)}"
+    )
+    return result.exit_code
+def _refs(args: argparse.Namespace, config: BotConfig) -> int:
+    if args.pin and args.unpin:
+        raise BotError("--pin and --unpin are mutually exclusive")
+    manager = RetentionManager(Ledger(config.ledger_path), config.evidence_dir)
+    if args.pin:
+        if not args.run_id:
+            raise BotError("--pin requires --run")
+        source = args.source or REPORT_SOURCE
+        count = manager.pin(run_id=args.run_id, task_id=args.task_id, evidence_type=args.evidence_type, source=source)
+        print(f"pinned {count} evidence ref(s) for run={args.run_id} source={source}")
+        return 0
+    if args.unpin:
+        if not args.run_id:
+            raise BotError("--unpin requires --run")
+        count = manager.unpin(run_id=args.run_id, task_id=args.task_id, evidence_type=args.evidence_type, source=args.source)
+        print(f"released {count} evidence ref(s) for run={args.run_id}")
+        return 0
+    rows = manager.list_refs(
+        run_id=args.run_id,
+        task_id=args.task_id,
+        biz_key=args.biz_key,
+        evidence_type=args.evidence_type,
+        source=args.source,
+        active_only=not args.include_released,
+    )
+    if not rows:
+        print("no evidence refs found")
+        return 0
+    for row in rows:
+        state = "active" if row["released_at"] is None else "released"
+        print(f"{row['run_id']} {row['task_id'] or '-'} {row['biz_key'] or '-'} {row['evidence_type']} {row['source']} {state} {row['path']}")
+    return 0
 def _mock_serve(args: argparse.Namespace) -> int:
     if not 1 <= args.port <= 65535:
         raise BotError("--port must be between 1 and 65535")
@@ -127,6 +194,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _resume(args, config)
         if args.command == "report":
             return _report(args, config)
+        if args.command == "cleanup":
+            return _cleanup(args, config)
+        if args.command == "refs":
+            return _refs(args, config)
         parser.error(f"unknown command: {args.command}")
     except TaskValidationError as exc:
         print(str(exc), file=sys.stderr)

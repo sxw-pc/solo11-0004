@@ -12,6 +12,7 @@ from fillbot.config import BotConfig
 from fillbot.dsl.engine import DSLExecutor
 from fillbot.dsl.schema import Script
 from fillbot.errors import BotError, ScriptError
+from fillbot.evidence.retention import RetentionManager
 from fillbot.evidence.store import EvidenceStore, is_sensitive
 from fillbot.ledger.db import Ledger
 from fillbot.ledger.report import export_summary
@@ -77,6 +78,11 @@ class Runner:
         return context
     def _retry_policy(self) -> RetryPolicy:
         return RetryPolicy(self.config.max_retries + 1, self.config.backoff_base_seconds, self.config.backoff_max_seconds, self.config.jitter, sleeper=self.sleeper)
+    def _register_ref(self, run_id: str, task: TaskRecord, evidence_type: str, path: str, logger: logging.Logger) -> None:
+        try:
+            self.ledger.register_evidence_ref(run_id, task.task_id, task.biz_key, evidence_type, path)
+        except Exception as exc:  # registration failure must not fail the task; cleanup stays conservative
+            logger.warning("task %s evidence ref registration failed type=%s error=%s", task.task_id, evidence_type, exc)
     def _execute_task(self, run_id: str, task: TaskRecord, script: Script, logger: logging.Logger, dry_run: bool) -> tuple[TaskStatus, str | None, str | None, str | None, int, str, list]:
         started, started_at = utcnow(), iso_now()
         evidence_dir = str(self.evidence.task_dir(run_id, task.task_id))
@@ -86,11 +92,14 @@ class Runner:
         browser = self._factory()
         env = {**os.environ, "FILLBOT_BASE_URL": self.config.base_url}
         def snapshot_cb(step, page, status):
-            snapshots[step.index] = str(
+            path = str(
                 self.evidence.snapshot(run_id, task.task_id, step.index, page, secret_values=secrets)
             )
+            snapshots[step.index] = path
+            self._register_ref(run_id, task, "snapshot", path, logger)
         def action_cb(record):
-            self.evidence.append_action(run_id, task.task_id, record)
+            path = self.evidence.append_action(run_id, task.task_id, record)
+            self._register_ref(run_id, task, "actions", str(path), logger)
         def retry_cb(step, attempt, error, delay):
             logger.warning(
                 "task %s step %s action=%s retry=%s delay=%.3fs error=%s",
@@ -134,7 +143,8 @@ class Runner:
                 if problem:
                     status, error_class, error_message, receipt = TaskStatus.FAILED, "ASSERT", problem, None
                 else:
-                    self.evidence.save_receipt(run_id, task.task_id, browser.page, secret_values=secrets)
+                    receipt_path = self.evidence.save_receipt(run_id, task.task_id, browser.page, secret_values=secrets)
+                    self._register_ref(run_id, task, "receipt", str(receipt_path), logger)
             elif status == TaskStatus.DRY_RUN:
                 receipt = None
             duration = elapsed_ms(started)
@@ -185,7 +195,13 @@ class Runner:
             run.status = RunStatus.SUCCESS
         self.ledger.finish_run(run)
         export_summary(self.ledger, run.run_id, self.config.runs_dir / run.run_id)
-        self.evidence.cleanup()
+        try:
+            RetentionManager(
+                self.ledger, self.config.evidence_dir, retention_days=self.config.evidence_retention_days
+            ).cleanup()
+        except Exception as exc:  # cleanup failure only warns; it never affects the run itself
+            if self._logger is not None:
+                self._logger.warning("evidence retention cleanup failed: %s", exc)
         return run
     def run(self, tasks: Sequence[TaskRecord], script: Script, *, task_source: str = "", script_source: str = "", dry_run: bool = False, run_id: str | None = None, resume: bool = False, options: dict | None = None) -> RunRecord:
         if not tasks:

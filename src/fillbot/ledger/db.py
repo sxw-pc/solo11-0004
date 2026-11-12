@@ -1,4 +1,4 @@
-"""SQLite ledger: runs, tasks and steps, with a global receipt uniqueness rule."""
+"""SQLite ledger: runs, tasks, steps and evidence refs, with a global receipt uniqueness rule."""
 from __future__ import annotations
 import json
 import sqlite3
@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 from fillbot.errors import ScriptError
-from fillbot.models import RunRecord, StepResult, TaskRecord, TaskSummary
+from fillbot.models import RunRecord, StepResult, TaskRecord, TaskSummary, iso_now
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
   run_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL,
@@ -25,9 +25,17 @@ CREATE TABLE IF NOT EXISTS steps (
   duration_ms INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, error_class TEXT,
   error_message TEXT, snapshot_path TEXT, UNIQUE(run_id, task_id, step_index),
   FOREIGN KEY(run_id) REFERENCES runs(run_id));
+CREATE TABLE IF NOT EXISTS evidence_refs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, task_id TEXT NOT NULL DEFAULT '',
+  biz_key TEXT NOT NULL DEFAULT '', evidence_type TEXT NOT NULL, path TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'run', created_at TEXT NOT NULL, released_at TEXT,
+  UNIQUE(run_id, evidence_type, path, source));
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_receipt_unique ON tasks(receipt_no)
   WHERE receipt_no IS NOT NULL AND receipt_no <> '';
 CREATE INDEX IF NOT EXISTS idx_tasks_biz_key ON tasks(biz_key, status);
+CREATE INDEX IF NOT EXISTS idx_evidence_refs_path ON evidence_refs(path);
+CREATE INDEX IF NOT EXISTS idx_evidence_refs_run ON evidence_refs(run_id, evidence_type);
+CREATE INDEX IF NOT EXISTS idx_evidence_refs_biz_key ON evidence_refs(biz_key);
 """
 _TASK_COLUMNS = "run_id, task_id, biz_key, status, started_at, finished_at, duration_ms, attempts, error_class, error_message, receipt_no, evidence_dir"
 _STEP_COLUMNS = "run_id, task_id, step_index, action, status, started_at, finished_at, duration_ms, attempts, error_class, error_message, snapshot_path"
@@ -177,6 +185,142 @@ class Ledger:
         if task_id is not None:
             sql, params = sql + " AND task_id = ?", params + [task_id]
         return [dict(row) for row in self._fetch(sql + " ORDER BY task_id ASC, step_index ASC", tuple(params))]
+    def list_runs(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self._fetch("SELECT * FROM runs ORDER BY started_at ASC, rowid ASC", ())]
+    def register_evidence_ref(
+        self,
+        run_id: str,
+        task_id: str,
+        biz_key: str,
+        evidence_type: str,
+        path: str,
+        *,
+        source: str = "run",
+        created_at: str | None = None,
+    ) -> None:
+        """Register (or re-activate) one evidence reference; idempotent per (run, type, path, source)."""
+        self._write(
+            "INSERT INTO evidence_refs (run_id, task_id, biz_key, evidence_type, path, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(run_id, evidence_type, path, source) DO UPDATE SET released_at = NULL, "
+            "task_id = excluded.task_id, biz_key = excluded.biz_key",
+            (run_id, task_id, biz_key, evidence_type, path, source, created_at or iso_now()),
+        )
+    def list_evidence_refs(
+        self,
+        *,
+        run_id: str | None = None,
+        task_id: str | None = None,
+        biz_key: str | None = None,
+        evidence_type: str | None = None,
+        source: str | None = None,
+        active_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        clauses, params = ["1=1"], []
+        for column, value in (
+            ("run_id", run_id),
+            ("task_id", task_id),
+            ("biz_key", biz_key),
+            ("evidence_type", evidence_type),
+            ("source", source),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        if active_only:
+            clauses.append("released_at IS NULL")
+        sql = f"SELECT * FROM evidence_refs WHERE {' AND '.join(clauses)} ORDER BY run_id ASC, evidence_type ASC, path ASC, source ASC"
+        return [dict(row) for row in self._fetch(sql, tuple(params))]
+    def release_evidence_refs(
+        self,
+        *,
+        run_id: str | None = None,
+        source: str | None = None,
+        paths: list[str] | None = None,
+        ids: list[int] | None = None,
+        released_at: str | None = None,
+    ) -> int:
+        """Mark matching refs released; returns how many refs transitioned."""
+        clauses, params = ["released_at IS NULL"], []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(source)
+        if paths is not None:
+            if not paths:
+                return 0
+            clauses.append("path IN (" + ",".join("?" * len(paths)) + ")")
+            params.extend(paths)
+        if ids is not None:
+            if not ids:
+                return 0
+            clauses.append("id IN (" + ",".join("?" * len(ids)) + ")")
+            params.extend(ids)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"UPDATE evidence_refs SET released_at = ? WHERE {' AND '.join(clauses)}",
+                (released_at or iso_now(), *params),
+            )
+            return cursor.rowcount
+    def run_has_evidence_refs(self, run_id: str) -> bool:
+        return self._fetch("SELECT 1 FROM evidence_refs WHERE run_id = ? LIMIT 1", (run_id,), one=True) is not None
+    @staticmethod
+    def _insert_ref(
+        connection: sqlite3.Connection,
+        run_id: str,
+        task_id: str,
+        biz_key: str,
+        evidence_type: str,
+        path: str,
+        created_at: str,
+    ) -> int:
+        cursor = connection.execute(
+            "INSERT OR IGNORE INTO evidence_refs (run_id, task_id, biz_key, evidence_type, path, source, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 'run', ?)",
+            (run_id, task_id, biz_key, evidence_type, path, created_at),
+        )
+        return cursor.rowcount
+    def backfill_evidence_refs(self, *, now: str | None = None) -> int:
+        """Register refs for runs that predate the registry (legacy data); returns refs inserted.
+
+        Runs with no derivable references are left untouched so cleanup keeps
+        them conservatively; any database error aborts the caller before any
+        evidence is deleted.
+        """
+        stamp = now or iso_now()
+        inserted = 0
+        with self.connect() as connection:
+            run_ids = [str(row["run_id"]) for row in connection.execute("SELECT run_id FROM runs")]
+            for run_id in run_ids:
+                if connection.execute("SELECT 1 FROM evidence_refs WHERE run_id = ? LIMIT 1", (run_id,)).fetchone():
+                    continue
+                tasks = connection.execute(
+                    "SELECT task_id, biz_key, receipt_no, evidence_dir FROM tasks WHERE run_id = ?", (run_id,)
+                ).fetchall()
+                biz_keys = {str(task["task_id"]): str(task["biz_key"]) for task in tasks}
+                for task in tasks:
+                    evidence_dir = str(task["evidence_dir"] or "")
+                    if not evidence_dir:
+                        continue
+                    task_id = str(task["task_id"])
+                    inserted += self._insert_ref(
+                        connection, run_id, task_id, biz_keys[task_id], "actions", str(Path(evidence_dir) / "actions.jsonl"), stamp
+                    )
+                    if task["receipt_no"]:
+                        inserted += self._insert_ref(
+                            connection, run_id, task_id, biz_keys[task_id], "receipt", str(Path(evidence_dir) / "receipt.html"), stamp
+                        )
+                steps = connection.execute(
+                    "SELECT DISTINCT task_id, snapshot_path FROM steps WHERE run_id = ? AND snapshot_path IS NOT NULL AND snapshot_path <> ''",
+                    (run_id,),
+                ).fetchall()
+                for step in steps:
+                    task_id = str(step["task_id"])
+                    inserted += self._insert_ref(
+                        connection, run_id, task_id, biz_keys.get(task_id, ""), "snapshot", str(step["snapshot_path"]), stamp
+                    )
+        return inserted
     def list_tasks(self, run_id: str) -> list[TaskSummary]:
         return [
             TaskSummary(

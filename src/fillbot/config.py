@@ -16,6 +16,7 @@ _DEFAULTS: dict[str, Any] = {
     "jitter": True,
     "rate_limit_per_minute": 60,
     "evidence_keep_runs": 10,
+    "evidence_retention_days": 30,
     "evidence_dir": "evidence",
     "ledger_path": "data/ledger.db",
     "runs_dir": "runs",
@@ -31,6 +32,7 @@ _ENV_MAP = {
     "FILLBOT_JITTER": "jitter",
     "FILLBOT_RATE_LIMIT_PER_MINUTE": "rate_limit_per_minute",
     "FILLBOT_EVIDENCE_KEEP_RUNS": "evidence_keep_runs",
+    "FILLBOT_EVIDENCE_RETENTION_DAYS": "evidence_retention_days",
     "FILLBOT_EVIDENCE_DIR": "evidence_dir",
     "FILLBOT_LEDGER_PATH": "ledger_path",
     "FILLBOT_RUNS_DIR": "runs_dir",
@@ -57,7 +59,7 @@ def _num(value: Any, name: str, cast: type, minimum: float) -> float | int:
 def _coerce(key: str, value: Any) -> Any:
     if key in {"timeout_seconds", "backoff_base_seconds", "backoff_max_seconds"}:
         return _num(value, key, float, 0.01)
-    if key in {"max_retries", "evidence_keep_runs"}:
+    if key in {"max_retries", "evidence_keep_runs", "evidence_retention_days"}:
         return _num(value, key, int, 0)
     if key == "rate_limit_per_minute":
         return _num(value, key, int, 1)
@@ -86,6 +88,7 @@ class BotConfig:
     jitter: bool = True
     rate_limit_per_minute: int = 60
     evidence_keep_runs: int = 10
+    evidence_retention_days: int = 30
     evidence_dir: Path = field(default_factory=lambda: Path("evidence"))
     ledger_path: Path = field(default_factory=lambda: Path("data/ledger.db"))
     runs_dir: Path = field(default_factory=lambda: Path("runs"))
