@@ -10,7 +10,7 @@ from fillbot.dsl.actions import ACTION_HANDLERS, ActionContext
 from fillbot.dsl.schema import Script, Step, available_actions
 from fillbot.errors import BotError, ScriptError, UndefinedVariableError, UnregisteredActionError
 from fillbot.models import EngineResult, StepResult, StepStatus, TaskStatus, iso_now
-from fillbot.runner.retry import RetryPolicy, run_with_retry
+from fillbot.runner.retry import RetryChain, RetryLayer, RetryPolicy, run_with_retry
 _VAR = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*)\s*\}\}")
 class DSLExecutor:
     def __init__(
@@ -25,19 +25,26 @@ class DSLExecutor:
         snapshot_cb: Callable[[Step, Page, StepStatus], None] | None = None,
         action_log_cb: Callable[[dict[str, Any]], None] | None = None,
         retry_cb: Callable[[Step, int, BotError, float], None] | None = None,
+        retry_chain: RetryChain | None = None,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.script, self.browser = script, browser
         self.task_context, self.run_id = dict(task_context), run_id
         self.env = dict(os.environ if env is None else env)
-        self.default_retry = default_retry or RetryPolicy()
+        self.default_retry = default_retry or RetryPolicy(layer=RetryLayer.STEP)
         self.snapshot_cb, self.action_log_cb, self.retry_cb, self.sleeper = (
             snapshot_cb,
             action_log_cb,
             retry_cb,
             sleeper,
         )
+        # One chain per task execution: a Retry-After header honoured by a step
+        # retry is not honoured again when the task-level layer replays.
+        self.retry_chain = retry_chain or RetryChain()
         self.variables: dict[str, Any] = {}
+        # Set when a final click step is the failing step; the scheduler uses
+        # this to gate whole-task replays behind the ledger idempotency key.
+        self.final_failure = False
     def _lookup(self, expression: str, step_no: int) -> Any:
         parts = expression.split(".")
         sources: dict[str, Any] = {
@@ -79,13 +86,23 @@ class DSLExecutor:
         return replace(step, params=params, locator=locator)
     def _policy_for(self, step: Step) -> RetryPolicy:
         base = self.default_retry
+        layer = RetryLayer.STEP
         if not step.retry_explicit:
-            return base
+            return RetryPolicy(
+                base.max_attempts,
+                base.base_seconds,
+                base.max_seconds,
+                base.jitter,
+                layer,
+                base.rng,
+                base.sleeper,
+            )
         return RetryPolicy(
             step.retry.attempts,
             step.retry.base_seconds,
             max(step.retry.max_seconds, step.retry.base_seconds),
             base.jitter,
+            layer,
             base.rng,
             base.sleeper,
         )
@@ -150,9 +167,11 @@ class DSLExecutor:
             if self.retry_cb:
                 self.retry_cb(step, attempt, error, delay)
         try:
-            outcome = run_with_retry(invoke, self._policy_for(step), on_retry=callback)
+            outcome = run_with_retry(invoke, self._policy_for(step), on_retry=callback, chain=self.retry_chain)
         except BotError as error:
             error.details.setdefault("attempts", attempts[0])
+            if step.final:
+                self.final_failure = True
             raise
         if step.action == "extract":
             self.variables[str(step.params["save_as"])] = outcome.value
@@ -180,7 +199,13 @@ class DSLExecutor:
                 if step.on_error in {"skip", "continue"}:
                     continue
                 return EngineResult(
-                    TaskStatus.FAILED, dict(self.variables), results, caught.message, caught.category.value
+                    TaskStatus.FAILED,
+                    dict(self.variables),
+                    results,
+                    caught.message,
+                    caught.category.value,
+                    final_failure=self.final_failure,
+                    retry_after=caught.retry_after,
                 )
             results.append(self._record(step, status, started_at, clock, attempts))
         receipt = self.variables.get("receipt_no")

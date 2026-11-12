@@ -7,6 +7,7 @@ from typing import Any, Mapping
 import yaml
 from fillbot.browser.base import Locator
 from fillbot.errors import ScriptError, UnregisteredActionError
+from fillbot.runner.retry import RetrySpec, parse_retry_spec
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 @dataclass(frozen=True)
 class ActionSpec:
@@ -32,11 +33,6 @@ ACTION_REGISTRY = {
 }
 COMMON_KEYS = frozenset({"on_error", "retry", "timeout", "final"})
 ON_ERROR_VALUES = frozenset({"fail", "skip", "continue"})
-@dataclass(frozen=True)
-class RetrySpec:
-    attempts: int = 1
-    base_seconds: float = 0.0
-    max_seconds: float = 8.0
 @dataclass(frozen=True)
 class Step:
     index: int
@@ -72,27 +68,12 @@ def _locator_for(action: str, raw: dict[str, Any], step_no: int) -> Locator | No
         raise ScriptError(f"step {step_no}: {key} must be a non-empty string")
     return Locator(**{("css" if key == "selector" else "label"): value.strip()})
 def _parse_retry(raw: Any, step_no: int) -> RetrySpec:
-    if raw is None:
-        return RetrySpec()
-    if isinstance(raw, bool):
-        raise ScriptError(f"step {step_no}: retry must be a mapping or integer")
-    if isinstance(raw, int):
-        if raw < 1:
-            raise ScriptError(f"step {step_no}: retry.attempts must be >= 1")
-        return RetrySpec(attempts=raw)
-    if not isinstance(raw, dict):
-        raise ScriptError(f"step {step_no}: retry must be a mapping or integer")
-    unknown = set(raw) - {"attempts", "base_seconds", "max_seconds"}
-    if unknown:
-        raise ScriptError(f"step {step_no}: unknown retry key(s): {', '.join(sorted(unknown))}")
-    attempts, base, maximum = raw.get("attempts", 1), raw.get("base_seconds", 0.0), raw.get("max_seconds", 8.0)
-    if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 1:
-        raise ScriptError(f"step {step_no}: retry.attempts must be an integer >= 1")
-    if not isinstance(base, (int, float)) or isinstance(base, bool) or base < 0:
-        raise ScriptError(f"step {step_no}: retry.base_seconds must be >= 0")
-    if not isinstance(maximum, (int, float)) or isinstance(maximum, bool) or maximum < base:
-        raise ScriptError(f"step {step_no}: retry.max_seconds must be >= base_seconds")
-    return RetrySpec(attempts=attempts, base_seconds=float(base), max_seconds=float(maximum))
+    # Validation lives in the shared retry module so YAML parsing, config
+    # defaults and runtime policies all speak the same retry vocabulary.
+    try:
+        return parse_retry_spec(raw, step_no)
+    except ValueError as exc:
+        raise ScriptError(str(exc)) from exc
 def _check_param_types(action: str, params: dict[str, Any], step_no: int) -> None:
     def fail(message: str) -> None:
         raise ScriptError(f"step {step_no}: {message}")

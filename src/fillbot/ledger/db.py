@@ -28,6 +28,12 @@ CREATE TABLE IF NOT EXISTS steps (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_receipt_unique ON tasks(receipt_no)
   WHERE receipt_no IS NOT NULL AND receipt_no <> '';
 CREATE INDEX IF NOT EXISTS idx_tasks_biz_key ON tasks(biz_key, status);
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  biz_key TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  registered_at TEXT NOT NULL
+);
 """
 _TASK_COLUMNS = "run_id, task_id, biz_key, status, started_at, finished_at, duration_ms, attempts, error_class, error_message, receipt_no, evidence_dir"
 _STEP_COLUMNS = "run_id, task_id, step_index, action, status, started_at, finished_at, duration_ms, attempts, error_class, error_message, snapshot_path"
@@ -209,3 +215,19 @@ class Ledger:
     def task_status(self, run_id: str, task_id: str) -> str | None:
         row = self._fetch("SELECT status FROM tasks WHERE run_id = ? AND task_id = ?", (run_id, task_id), one=True)
         return str(row["status"]) if row else None
+
+    def register_idempotency_key(self, biz_key: str, run_id: str, task_id: str, registered_at: str) -> None:
+        """Record that ``biz_key`` may be safely replayed after an uncertain write.
+
+        Additive registry: existing tables and columns are untouched and a
+        duplicate registration is a no-op so resume stays deterministic.
+        """
+        self._write(
+            "INSERT INTO idempotency_keys (biz_key, run_id, task_id, registered_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(biz_key) DO NOTHING",
+            (biz_key, run_id, task_id, registered_at),
+        )
+
+    def has_idempotency_key(self, biz_key: str) -> bool:
+        row = self._fetch("SELECT 1 FROM idempotency_keys WHERE biz_key = ? LIMIT 1", (biz_key,), one=True)
+        return row is not None

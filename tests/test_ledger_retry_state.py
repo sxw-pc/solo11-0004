@@ -6,11 +6,11 @@ import random
 import sqlite3
 from pathlib import Path
 import pytest
-from fillbot.errors import BotError, ClientError, ScriptError, ServerError
+from fillbot.errors import BotError, ClientError, NetworkError, ScriptError, ServerError
 from fillbot.ledger.db import Ledger
 from fillbot.ledger.report import build_summary, export_summary, print_summary, render_summary
 from fillbot.models import RunRecord, StepResult, StepStatus, TaskRecord, TaskStatus, iso_now
-from fillbot.runner.retry import RetryPolicy, run_with_retry
+from fillbot.runner.retry import RetryChain, RetryLayer, RetryPolicy, parse_retry_spec, run_with_retry
 from fillbot.runner.state import RunStateMachine, TaskStateMachine, plan_resume
 def _run(run_id: str = "R-1") -> RunRecord:
     return RunRecord(
@@ -29,7 +29,7 @@ def test_ledger_dao_and_duplicate_receipt(tmp_path: Path) -> None:
     ledger = Ledger(tmp_path / "ledger.db")
     with sqlite3.connect(ledger.path) as connection:
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
-    assert tables == {"runs", "tasks", "steps"}
+    assert tables == {"runs", "tasks", "steps", "idempotency_keys"}
     ledger.create_run(_run())
     assert ledger.latest_run_id() == "R-1" and ledger.get_run("missing") is None
     ledger.start_task("R-1", _task("T-1", "C1:q"), iso_now(), "/evidence/T-1")
@@ -54,6 +54,12 @@ def test_ledger_dao_and_duplicate_receipt(tmp_path: Path) -> None:
         _finish(ledger, "T-4", "success", receipt_no="RCP-20260101-0001")
     ledger.start_task("R-1", _task("T-1", "C1:q"), iso_now(), "e")
     assert ledger.list_steps("R-1", "T-1") == []
+    # Idempotency registry is additive and keyed by biz_key; duplicate writes
+    # are no-ops so resume registration stays deterministic.
+    assert ledger.has_idempotency_key("C1:q") is False
+    ledger.register_idempotency_key("C1:q", "R-1", "T-1", iso_now())
+    ledger.register_idempotency_key("C1:q", "R-2", "T-9", iso_now())
+    assert ledger.has_idempotency_key("C1:q") is True and ledger.has_idempotency_key("C9:q") is False
 def test_summary_export_and_print(tmp_path: Path) -> None:
     ledger = Ledger(tmp_path / "ledger.db")
     ledger.create_run(_run())
@@ -89,34 +95,79 @@ def test_summary_export_and_print(tmp_path: Path) -> None:
         build_summary(ledger, "missing")
 def test_retry_policy_paths() -> None:
     sleeps: list[float] = []
-    policy = RetryPolicy(3, 1.0, 4.0, True, rng=random.Random(1), sleeper=sleeps.append)
+    policy = RetryPolicy(3, 1.0, 4.0, True, RetryLayer.STEP, rng=random.Random(1), sleeper=sleeps.append)
     assert 0.75 <= policy.compute_delay(1) <= 1.25 and 1.5 <= policy.compute_delay(2) <= 2.5
     assert policy.compute_delay(9) <= 4.0 and policy.compute_delay(1, ServerError("x", retry_after=7.5)) == 7.5
     assert RetryPolicy(base_seconds=1, max_seconds=4, jitter=False).compute_delay(3) == 4.0
+    # Shared YAML parser: integer and mapping forms, with the same error text.
+    assert parse_retry_spec(3).attempts == 3
+    mapped = parse_retry_spec({"attempts": 2, "base_seconds": 0.5, "max_seconds": 2})
+    assert (mapped.attempts, mapped.base_seconds, mapped.max_seconds) == (2, 0.5, 2.0)
+    for bad in (True, 0, [], {"attempts": 0}, {"attempts": True}, {"jitter": 1}, {"base_seconds": -1}, {"base_seconds": 2, "max_seconds": 1}):
+        with pytest.raises(ValueError):
+            parse_retry_spec(bad, step_no=7)
+    # TASK layer retries a recoverable SERVER failure with exponential backoff.
     attempts, slept, hook = [], [], []
     def operation() -> str:
         attempts.append(1)
         if len(attempts) == 1:
             raise ServerError("first 500", status=500)
         return "ok"
-    outcome = run_with_retry(operation, RetryPolicy(2, 0.1, 1, jitter=False, sleeper=slept.append), on_retry=lambda *args: hook.append((args[0], args[1].category.value, args[2])))
+    outcome = run_with_retry(operation, RetryPolicy(2, 0.1, 1, jitter=False, layer=RetryLayer.TASK, sleeper=slept.append), on_retry=lambda *args: hook.append((args[0], args[1].category.value, args[2])))
     assert (outcome.value, outcome.attempts, slept, hook) == ("ok", 2, [0.1], [(1, "SERVER", 0.1)])
+    # STEP layer declines SERVER (it escalates to the task layer); no sleep.
+    server_calls = [0]
+    def server_failure() -> None:
+        server_calls[0] += 1
+        raise ServerError("boom", status=500)
+    with pytest.raises(ServerError):
+        run_with_retry(server_failure, RetryPolicy(3, 0.1, layer=RetryLayer.STEP, sleeper=slept.append))
+    assert server_calls[0] == 1
+    # STEP layer does retry transient NETWORK errors.
+    network_calls = [0]
+    def network_failure() -> None:
+        network_calls[0] += 1
+        if network_calls[0] == 1:
+            raise NetworkError("timeout")
+    assert run_with_retry(network_failure, RetryPolicy(2, 0.1, layer=RetryLayer.STEP, jitter=False, sleeper=slept.append)).attempts == 2
+    # CLIENT errors are never retried at either layer.
     calls = [0]
     def client_failure() -> None:
         calls[0] += 1
         raise ClientError("bad", status=400)
     with pytest.raises(ClientError):
-        run_with_retry(client_failure, RetryPolicy(3, 0.1, sleeper=slept.append))
+        run_with_retry(client_failure, RetryPolicy(3, 0.1, layer=RetryLayer.TASK, sleeper=slept.append))
     assert calls[0] == 1
     with pytest.raises(ValueError):
         run_with_retry(lambda: (_ for _ in ()).throw(ValueError("bug")), RetryPolicy(3))
+    # Retry-After is honoured once per chain even when both layers see it.
+    chain = RetryChain()
     limited = [0]
     def always_limited() -> None:
         limited[0] += 1
         raise ServerError("limited", status=429, retry_after=3.0)
+    step_policy = RetryPolicy(3, 0.1, 1, jitter=False, layer=RetryLayer.STEP, sleeper=sleeps.append)
     with pytest.raises(BotError):
-        run_with_retry(always_limited, RetryPolicy(3, 5, 10, jitter=False, sleeper=sleeps.append))
-    assert limited[0] == 3 and sleeps[-2:] == [3.0, 3.0]
+        run_with_retry(always_limited, step_policy, chain=chain)
+    # STEP declines SERVER immediately (one call, no sleep) and leaves the
+    # Retry-After directive untouched for the task layer to consume.
+    assert limited[0] == 1 and 3.0 not in sleeps
+    task_policy = RetryPolicy(3, 0.1, 1, jitter=False, layer=RetryLayer.TASK, sleeper=sleeps.append)
+    with pytest.raises(BotError):
+        run_with_retry(always_limited, task_policy, chain=chain)
+    # Three task attempts: the first waits the header once, the remaining two
+    # fall back to backoff because the chain already consumed Retry-After.
+    assert limited[0] == 4
+    assert sleeps.count(3.0) == 1 and sleeps[-1] != 3.0
+    # Standalone (no chain) keeps honouring the header on every attempt.
+    standalone = [0]
+    standalone_sleeps: list[float] = []
+    def standalone_limited() -> None:
+        standalone[0] += 1
+        raise ServerError("limited", status=429, retry_after=3.0)
+    with pytest.raises(BotError):
+        run_with_retry(standalone_limited, RetryPolicy(3, 5, 10, jitter=False, layer=RetryLayer.TASK, sleeper=standalone_sleeps.append))
+    assert standalone[0] == 3 and standalone_sleeps == [3.0, 3.0]
     for arguments in ({"max_attempts": 0}, {"base_seconds": -1}, {"base_seconds": 2, "max_seconds": 1}):
         with pytest.raises(ValueError):
             RetryPolicy(**arguments)

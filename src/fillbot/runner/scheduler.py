@@ -5,19 +5,20 @@ import os
 import re
 import time
 from collections import Counter
+from datetime import datetime
 from typing import Callable, Sequence
 from fillbot.browser.base import BrowserSession
 from fillbot.browser.mechanical import MechanicalBrowser
 from fillbot.config import BotConfig
 from fillbot.dsl.engine import DSLExecutor
 from fillbot.dsl.schema import Script
-from fillbot.errors import BotError, ScriptError
+from fillbot.errors import BotError, ErrorClass, ScriptError
 from fillbot.evidence.store import EvidenceStore, is_sensitive
 from fillbot.ledger.db import Ledger
 from fillbot.ledger.report import export_summary
 from fillbot.models import RunRecord, RunStatus, TaskRecord, TaskStatus, elapsed_ms, iso_now, utcnow
 from fillbot.runner.pacing import RateLimiter, new_run_id
-from fillbot.runner.retry import RetryPolicy
+from fillbot.runner.retry import RetryChain, RetryLayer, RetryPolicy
 from fillbot.runner.state import plan_resume
 RECEIPT_RE = re.compile(r"^RCP-\d{8}-\d{4}$")
 BrowserFactory = Callable[[], BrowserSession]
@@ -75,16 +76,99 @@ class Runner:
         context: dict[str, object] = dict(task.payload)
         context.update({"task_id": task.task_id, "biz_key": task.biz_key, "attachments": [str(path) for path in task.attachments], "attachment": str(task.attachment) if task.attachment else ""})
         return context
-    def _retry_policy(self) -> RetryPolicy:
-        return RetryPolicy(self.config.max_retries + 1, self.config.backoff_base_seconds, self.config.backoff_max_seconds, self.config.jitter, sleeper=self.sleeper)
+    def _step_retry_policy(self) -> RetryPolicy:
+        # Step layer: transient network failures only (timeouts, resets).
+        return RetryPolicy(
+            self.config.max_retries + 1,
+            self.config.backoff_base_seconds,
+            self.config.backoff_max_seconds,
+            self.config.jitter,
+            RetryLayer.STEP,
+            sleeper=self.sleeper,
+        )
+
+    def _task_retry_policy(self) -> RetryPolicy:
+        # Task layer: recoverable state failures (5xx/429) only, replaying the
+        # whole task with a fresh browser session.
+        return RetryPolicy(
+            self.config.max_retries + 1,
+            self.config.backoff_base_seconds,
+            self.config.backoff_max_seconds,
+            self.config.jitter,
+            RetryLayer.TASK,
+            sleeper=self.sleeper,
+        )
     def _execute_task(self, run_id: str, task: TaskRecord, script: Script, logger: logging.Logger, dry_run: bool) -> tuple[TaskStatus, str | None, str | None, str | None, int, str, list]:
+        """Run one task with the layered retry strategy.
+
+        Step-level retries (network only) live inside the DSL executor; this
+        loop adds the task-level layer (recoverable SERVER failures only).
+        Dry runs never replay, matching the historical single-attempt path.
+        """
         started, started_at = utcnow(), iso_now()
         evidence_dir = str(self.evidence.task_dir(run_id, task.task_id))
         self.ledger.start_task(run_id, task, started_at, evidence_dir)
         logger.info("task %s started biz_key=%s", task.task_id, task.biz_key)
+        policy = self._task_retry_policy()
+        chain = RetryChain()
+        last: tuple[TaskStatus, str | None, str | None, str | None, int, str, list] | None = None
+        last_error: BotError | None = None
+        for task_attempt in range(1, policy.max_attempts + 1):
+            last, last_error = self._attempt_task(
+                run_id, task, script, logger, dry_run, evidence_dir, started, chain
+            )
+            status = last[0]
+            if status != TaskStatus.FAILED or dry_run or last_error is None:
+                return last
+            if not policy.allows(last_error):
+                logger.info(
+                    "task %s not retryable at task layer class=%s", task.task_id, last_error.category.value
+                )
+                return last
+            if last_error.details.get("final_failure") and not self.ledger.has_idempotency_key(task.biz_key):
+                # A final click may already have written server-side. Without
+                # an idempotency key on record we prefer failing before any
+                # duplicate write over replaying in an uncertain state.
+                logger.error(
+                    "task %s final step failed class=%s but no idempotency key is registered; "
+                    "skipping task-level replay to avoid duplicate submission",
+                    task.task_id,
+                    last_error.category.value,
+                )
+                return last
+            if task_attempt >= policy.max_attempts:
+                return last
+            delay = policy.compute_delay(task_attempt, last_error, chain)
+            logger.warning(
+                "task %s task-level retry=%s/%s delay=%.3fs error=%s",
+                task.task_id,
+                task_attempt,
+                policy.max_attempts - 1,
+                delay,
+                last_error.category.value,
+            )
+            if delay > 0:
+                self.sleeper(delay)
+            # Each replay gets a fresh browser session and a clean ledger row;
+            # the failure chain (and any consumed Retry-After) carries over.
+            self.ledger.start_task(run_id, task, iso_now(), evidence_dir)
+        return last  # pragma: no cover - loop always returns above
+
+    def _attempt_task(
+        self,
+        run_id: str,
+        task: TaskRecord,
+        script: Script,
+        logger: logging.Logger,
+        dry_run: bool,
+        evidence_dir: str,
+        started: datetime,
+        chain: RetryChain,
+    ) -> tuple[tuple[TaskStatus, str | None, str | None, str | None, int, str, list], BotError | None]:
         secrets, snapshots = self._secrets(task), {}
         browser = self._factory()
         env = {**os.environ, "FILLBOT_BASE_URL": self.config.base_url}
+        executor: DSLExecutor | None = None
         def snapshot_cb(step, page, status):
             snapshots[step.index] = str(
                 self.evidence.snapshot(run_id, task.task_id, step.index, page, secret_values=secrets)
@@ -108,10 +192,11 @@ class Runner:
                 task_context=self._task_context(task),
                 run_id=run_id,
                 env=env,
-                default_retry=self._retry_policy(),
+                default_retry=self._step_retry_policy(),
                 snapshot_cb=snapshot_cb,
                 action_log_cb=action_cb,
                 retry_cb=retry_cb,
+                retry_chain=chain,
                 sleeper=self.sleeper,
             )
             result = executor.execute(dry_run=dry_run)
@@ -121,6 +206,7 @@ class Runner:
             attempts = max((step.attempts for step in result.steps), default=1)
             receipt, status = result.receipt_no, result.status
             error_class, error_message = result.error_class, result.error
+            propagated_error: BotError | None = None
             if status == TaskStatus.SUCCESS:
                 problem = (
                     "script completed without extracting receipt_no"
@@ -137,6 +223,17 @@ class Runner:
                     self.evidence.save_receipt(run_id, task.task_id, browser.page, secret_values=secrets)
             elif status == TaskStatus.DRY_RUN:
                 receipt = None
+            elif status == TaskStatus.FAILED and error_class in {ErrorClass.SERVER.value, ErrorClass.NETWORK.value}:
+                # Engine-returned failure (no exception): hand the classified
+                # error to the task-level loop, preserving any Retry-After so
+                # the shared chain can honour the header at most once.
+                propagated_error = BotError(
+                    error_message or "task failed",
+                    ErrorClass(error_class),
+                    retry_after=result.retry_after,
+                )
+                if result.final_failure:
+                    propagated_error.details["final_failure"] = True
             duration = elapsed_ms(started)
             self.ledger.finish_task(run_id, task.task_id, status=status.value, finished_at=iso_now(), duration_ms=duration, attempts=attempts, error_class=error_class, error_message=error_message, receipt_no=receipt if status == TaskStatus.SUCCESS else None, evidence_dir=evidence_dir)
             logger.info(
@@ -146,9 +243,11 @@ class Runner:
                 error_class or "-",
                 receipt or "-",
             )
-            return status, receipt, error_class, error_message, attempts, evidence_dir, result.steps
+            return (status, receipt, error_class, error_message, attempts, evidence_dir, result.steps), propagated_error
         except Exception as exc:
             error = exc if isinstance(exc, BotError) else ScriptError(str(exc))
+            if executor is not None and executor.final_failure:
+                error.details.setdefault("final_failure", True)
             duration = elapsed_ms(started)
             self.ledger.finish_task(
                 run_id,
@@ -163,7 +262,7 @@ class Runner:
                 evidence_dir=evidence_dir,
             )
             logger.error("task %s crashed class=%s message=%s", task.task_id, error.category.value, error.message)
-            return TaskStatus.FAILED, None, error.category.value, error.message, 1, evidence_dir, []
+            return (TaskStatus.FAILED, None, error.category.value, error.message, 1, evidence_dir, []), error
         finally:
             browser.close()
     def _finalize(self, run: RunRecord, tasks: Sequence[TaskRecord], *, interrupted: bool = False) -> RunRecord:
@@ -221,7 +320,18 @@ class Runner:
             self.ledger.create_run(run)
             logger.info("start run=%s tasks=%s dry_run=%s", rid, len(tasks), dry_run)
         try:
-            completed = set(plan_resume(self.ledger, rid, tasks).completed_task_ids) if resume else set()
+            plan = plan_resume(self.ledger, rid, tasks) if resume else None
+            completed = set(plan.completed_task_ids) if resume else set()
+            if resume:
+                # A resumed task is explicitly re-driven by the operator after
+                # an interruption: register its idempotency key so a final-step
+                # SERVER failure can safely replay instead of risking a
+                # duplicate write with no way to tell whether the first attempt
+                # landed. Resume planning (which tasks remain) is unchanged.
+                for remaining in plan.remaining:
+                    self.ledger.register_idempotency_key(
+                        remaining.biz_key, rid, remaining.task_id, iso_now()
+                    )
             for task in tasks:
                 if task.task_id in completed:
                     logger.info("task %s already complete; skipped on resume", task.task_id)

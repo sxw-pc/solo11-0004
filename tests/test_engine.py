@@ -6,9 +6,9 @@ import pytest
 from fillbot.browser.base import BrowserSession, Locator, Page
 from fillbot.dsl.engine import DSLExecutor
 from fillbot.dsl.schema import Script, Step, validate_script
-from fillbot.errors import ClientError, ScriptError, ServerError
+from fillbot.errors import ClientError, NetworkError, ScriptError, ServerError
 from fillbot.models import StepStatus, TaskStatus
-from fillbot.runner.retry import RetryPolicy
+from fillbot.runner.retry import RetryChain, RetryLayer, RetryPolicy
 FORM = """
 <html><body><h1>填报表单</h1><label for="full_name">姓名</label><input id="full_name" name="full_name">
 <select id="color" name="color"><option value="green">绿</option></select>
@@ -17,7 +17,7 @@ FORM = """
 """
 RECEIPT = '<html><body><h1>报送回执</h1><span id="receipt">RCP-20260101-0001</span></body></html>'
 class FakeBrowser(BrowserSession):
-    def __init__(self, *, fail_clicks: int = 0, client_error: bool = False) -> None:
+    def __init__(self, *, fail_clicks: int = 0, client_error: bool = False, network_error: bool = False) -> None:
         self.current = Page(200, "http://start/", {}, "<html>start</html>")
         self.fills: list[tuple[Locator, str]] = []
         self.selects: list[tuple[Locator, str]] = []
@@ -25,6 +25,7 @@ class FakeBrowser(BrowserSession):
         self.uploads: list[tuple[Locator, Path]] = []
         self.opened: list[str] = []
         self.clicks, self.fail_clicks, self.client_error, self.closed = 0, fail_clicks, client_error, False
+        self.network_error = network_error
     @property
     def page(self) -> Page:
         return self.current
@@ -45,6 +46,8 @@ class FakeBrowser(BrowserSession):
         if self.clicks <= self.fail_clicks:
             if self.client_error:
                 raise ClientError("bad request", status=400)
+            if self.network_error:
+                raise NetworkError("timeout after 0.01s: POST http://start/submit")
             raise ServerError("transient", status=500)
         self.current = Page(200, "http://start/receipt", {}, RECEIPT)
         return self.current
@@ -139,18 +142,60 @@ def test_unregistered_handler_dry_run_and_retry() -> None:
     )
     assert dry.status == TaskStatus.DRY_RUN and fake.clicks == 0 and len(dry.steps) == 2
     assert dry.steps[-1].status == StepStatus.SKIPPED
+    # Step layer retries transient NETWORK errors per the YAML retry option.
     retried, retry_browser, sleeps, _ = _execute(
         [
             {"action": "open", "url": "http://x"},
             {"action": "click", "selector": "#submit", "retry": {"attempts": 3, "base_seconds": 0.01}},
         ],
-        browser=FakeBrowser(fail_clicks=1),
+        browser=FakeBrowser(fail_clicks=1, network_error=True),
     )
     assert retried.status == TaskStatus.SUCCESS and retried.steps[1].attempts == 2 and retry_browser.clicks == 2
     assert len(sleeps) == 1
-    exhausted, _, _, _ = _execute([{"action": "click", "selector": "#submit", "retry": 2}], browser=FakeBrowser(fail_clicks=5))
-    assert exhausted.status == TaskStatus.FAILED and exhausted.steps[0].attempts == 2 and exhausted.error_class == "SERVER"
+    # Integer retry form stays valid; exhausted step attempts surface the error.
+    exhausted, _, _, _ = _execute(
+        [{"action": "click", "selector": "#submit", "retry": 2}],
+        browser=FakeBrowser(fail_clicks=5, network_error=True),
+    )
+    assert exhausted.status == TaskStatus.FAILED and exhausted.steps[0].attempts == 2
+    assert exhausted.error_class == "NETWORK"
+    # SERVER failures are not retried at step level any more: they escalate to
+    # the task layer, so the click happens exactly once and no delay is slept.
+    escalated, server_browser, server_sleeps, _ = _execute(
+        [{"action": "open", "url": "http://x"}, {"action": "click", "selector": "#submit", "retry": 3}],
+        browser=FakeBrowser(fail_clicks=5),
+    )
+    assert escalated.status == TaskStatus.FAILED and escalated.error_class == "SERVER"
+    assert escalated.steps[1].attempts == 1 and server_browser.clicks == 1 and server_sleeps == []
+    # A failing final click is flagged so the scheduler can gate task replays.
+    final_fail, _, _, _ = _execute(
+        [
+            {"action": "open", "url": "http://x"},
+            {"action": "click", "selector": "#submit", "final": True, "retry": 3},
+        ],
+        browser=FakeBrowser(fail_clicks=5),
+    )
+    assert final_fail.status == TaskStatus.FAILED and final_fail.final_failure is True
     client, _, client_sleeps, _ = _execute(
         [{"action": "click", "selector": "#submit"}], browser=FakeBrowser(fail_clicks=5, client_error=True)
     )
     assert client.status == TaskStatus.FAILED and client.error_class == "CLIENT" and client_sleeps == []
+
+
+def test_retry_chain_honours_retry_after_once() -> None:
+    chain = RetryChain()
+    step_policy = RetryPolicy(3, 0.1, 1.0, jitter=False, layer=RetryLayer.STEP, sleeper=lambda _: None)
+    task_policy = RetryPolicy(3, 0.1, 1.0, jitter=False, layer=RetryLayer.TASK, sleeper=lambda _: None)
+    limited = ServerError("rate limited", status=429, retry_after=3.0)
+    # First encounter on the shared chain consumes Retry-After (3.0s)...
+    assert step_policy.compute_delay(1, limited, chain) == 3.0
+    # ...and a later layer on the same chain must not wait it again.
+    later = task_policy.compute_delay(1, limited, chain)
+    assert later == 0.1
+    # Without a chain the standalone historical behaviour is preserved.
+    assert step_policy.compute_delay(1, limited) == 3.0
+    # Categories are disjoint: STEP declines SERVER, TASK declines NETWORK.
+    assert step_policy.allows(NetworkError("timeout")) is True
+    assert step_policy.allows(limited) is False
+    assert task_policy.allows(limited) is True
+    assert task_policy.allows(NetworkError("timeout")) is False

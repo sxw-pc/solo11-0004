@@ -105,15 +105,21 @@ steps:
 | `runs_dir` / `FILLBOT_RUNS_DIR` | `runs` | run.log 与汇总目录 |
 | `mask_fields` | password/passwd/secret/token/csrf_token | 证据脱敏字段 |
 ## 错误、重试与状态
-错误类别：`NETWORK`、`SERVER`（均含 429/5xx）、`CLIENT`（4xx）、`ASSERT`、`SCRIPT`。只有 NETWORK/SERVER 自动重试；`Retry-After` 优先，其次指数退避 + 抖动。任务状态：`pending → running → success|failed|skipped|dry_run`；运行状态：`running → success|failed|interrupted|dry_run`，`interrupted/failed` 可续跑。未捕获异常（含 Ctrl+C/SystemExit）会把运行标记为 `interrupted` 后继续抛出。
+错误类别：`NETWORK`、`SERVER`（均含 429/5xx）、`CLIENT`（4xx）、`ASSERT`、`SCRIPT`。重试参数（attempts、base、max、jitter、Retry-After）由共享策略模块 `runner/retry.py` 统一解析与生效，分两层且互不叠加：
+- **步骤级（STEP，DSL 引擎内）**：只重试瞬时 `NETWORK` 错误（超时、连接中断），在单个步骤内按 YAML `retry` 或运行器默认策略退避；`SERVER`/`CLIENT`/`ASSERT`/`SCRIPT` 不在步骤内重试。
+- **任务级（TASK，调度器内）**：只处理可恢复状态失败（`SERVER`：5xx/429），用全新浏览器会话重放整个任务；`NETWORK`（已在步骤级耗尽）、`CLIENT`/`ASSERT`/`SCRIPT` 立即失败，不重放。
+- 退避顺序为 `Retry-After` 优先、其次指数退避 + 抖动；同一条失败链路上 `Retry-After` 只遵守一次（由 `RetryChain` 跨层记录），后续重试回退到指数退避，不会每层各等一遍。
+- `final: true` 的提交点击在任务级重试中默认**不自动重放**：失败时若台账 `idempotency_keys` 中查不到该任务的幂等键，宁可失败也不冒险重复写入；只有登记了幂等键（`resume` 会为剩余任务登记）才允许任务级重放。
+
+任务状态：`pending → running → success|failed|skipped|dry_run`；运行状态：`running → success|failed|interrupted|dry_run`，`interrupted/failed` 可续跑。未捕获异常（含 Ctrl+C/SystemExit）会把运行标记为 `interrupted` 后继续抛出。
 ## 幂等、dry-run 与续跑
 - 幂等键为 `biz_key`：台账中已有成功记录时，新任务直接记 `skipped`，不发起提交。
 - 回执号必须匹配 `RCP-YYYYMMDD-NNNN` 且全局唯一（SQLite 部分唯一索引 + 运行时检查）。
-- `--dry-run` 真实执行并留存步骤证据，但遇到 `final: true` 的点击前停止，状态为 `dry_run`，不产生回执。
-- `resume <run_id>` 从台账读取原任务/脚本路径，跳过 `success|skipped`，只执行余下任务；已成功的 `biz_key` 不会重复提交。
+- `--dry-run` 真实执行并留存步骤证据，但遇到 `final: true` 的点击前停止，状态为 `dry_run`，不产生回执，也不触发任务级重放。
+- `resume <run_id>` 从台账读取原任务/脚本路径，跳过 `success|skipped`，只执行余下任务；续跑会为剩余任务在 `idempotency_keys` 登记幂等键，使其 final 提交在遇到可恢复 `SERVER` 失败时可安全重放；已成功的 `biz_key` 不会重复提交。
 ## 证据与台账
 证据位于 `evidence/<run_id>/<task_id>/`：每步 `step-NN.html`（密码、token、secret 字段及已知敏感值替换为 `***`）、`actions.jsonl`（动作、定位器、结果、耗时、错误，不含填写值）、成功提交后的 `receipt.html`。证据快照会强制保存，便于审计后复核；保留策略只清理超期运行目录，不动台账。
-SQLite 三张表：`runs`（来源、状态、计数、时间）、`tasks`（任务、业务键、回执、错误、证据目录）、`steps`（步骤、动作、状态、尝试次数）。汇总写到 `runs/<run_id>/summary.json` 与 `summary.csv`，包含成功/失败/跳过数、失败原因分布、平均耗时与回执列表。
+SQLite 四张表：`runs`（来源、状态、计数、时间）、`tasks`（任务、业务键、回执、错误、证据目录）、`steps`（步骤、动作、状态、尝试次数）、`idempotency_keys`（允许 final 步骤安全重放的业务键登记，续跑时写入）。汇总写到 `runs/<run_id>/summary.json` 与 `summary.csv`，包含成功/失败/跳过数、失败原因分布、平均耗时与回执列表。
 ## 故障注入与 mock 站点
 `python -m fillbot mock-serve --chaos --chaos-seed 7 --chaos-rate 0.2 --delay-ms 50 --flaky-submit` 可启用确定性故障；也可用 `FILLBOT_CHAOS*` 环境变量。`--flaky-submit` 只让指定企业（默认 C003）首次提交返回 500，用于验证重试与证据。mock 站点含登录、三步填报、确认、提交、回执路由以及 `/healthz`、`/__mock/receipts` 辅助端点。
 ## 设计取舍

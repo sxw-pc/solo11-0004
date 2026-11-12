@@ -8,3 +8,4 @@ __pycache__/
 .benchmarks/
 .env
 dist/
+.deps/

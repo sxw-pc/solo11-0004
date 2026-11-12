@@ -70,6 +70,8 @@ class EngineResult:
     error_class: str | None = None
     receipt_no: str | None = None
     attempts: int = 1
+    final_failure: bool = False
+    retry_after: float | None = None
 @dataclass
 class RunRecord:
     run_id: str
