@@ -6,6 +6,8 @@ import time
 from dataclasses import replace
 from typing import Any, Callable, Mapping
 from fillbot.browser.base import BrowserSession, Locator, Page
+from fillbot.diagnostics.collector import classify_error
+from fillbot.diagnostics.rules import STAGE_INTERACTION, STAGE_STEP
 from fillbot.dsl.actions import ACTION_HANDLERS, ActionContext
 from fillbot.dsl.schema import Script, Step, available_actions
 from fillbot.errors import BotError, ScriptError, UndefinedVariableError, UnregisteredActionError
@@ -25,6 +27,7 @@ class DSLExecutor:
         snapshot_cb: Callable[[Step, Page, StepStatus], None] | None = None,
         action_log_cb: Callable[[dict[str, Any]], None] | None = None,
         retry_cb: Callable[[Step, int, BotError, float], None] | None = None,
+        exchange_cb: Callable[[dict[str, Any]], None] | None = None,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.script, self.browser = script, browser
@@ -37,7 +40,10 @@ class DSLExecutor:
             retry_cb,
             sleeper,
         )
+        self.exchange_cb = exchange_cb
         self.variables: dict[str, Any] = {}
+        self.last_snapshot_path: str | None = None
+        self.diagnosis_overhead_ms: float = 0.0
     def _lookup(self, expression: str, step_no: int) -> Any:
         parts = expression.split(".")
         sources: dict[str, Any] = {
@@ -96,6 +102,59 @@ class DSLExecutor:
             return self.browser.page
         except Exception:
             return None
+
+    def _diagnose(self, error: BotError, step: Step | None, *, stage: str) -> Any:
+        """Classify a step failure. Diagnostics are strictly best-effort."""
+        started = time.perf_counter()
+        try:
+            locator = step.locator.describe() if step is not None and step.locator else None
+            _, diagnosis = classify_error(
+                error,
+                stage=stage,
+                action=step.action if step is not None else None,
+                locator=locator,
+                step_index=step.index if step is not None else None,
+                page=self._safe_page(error),
+            )
+            self.diagnosis_overhead_ms += time.perf_counter() - started
+            self._log_exchange(step, error)
+            return diagnosis
+        except Exception:  # pragma: no cover - diagnostics must be inert
+            return None
+
+    def _log_exchange(self, step: Step | None, error: BotError) -> None:
+        """Record only failed request responses, keeping overhead off happy paths."""
+        if self.exchange_cb is None:
+            return
+        try:
+            details = dict(getattr(error, "details", {}) or {})
+            url = str(details.get("request_url") or "")
+            if not url:
+                return
+            page = self._safe_page(error)
+            headers = dict(getattr(page, "headers", {}) or {})
+            interesting = {
+                str(key): str(value)
+                for key, value in headers.items()
+                if str(key).lower() in {"retry-after", "location", "x-request-id", "content-type"}
+            }
+            self.exchange_cb(
+                {
+                    "step": step.index if step is not None else None,
+                    "action": step.action if step is not None else None,
+                    "method": details.get("method"),
+                    "request_url": url,
+                    "status": getattr(page, "status", None) or getattr(error, "status", None),
+                    "error_class": error.category.value,
+                    "error": error.message,
+                    "retry_after": getattr(error, "retry_after", None),
+                    "elapsed_ms": getattr(page, "elapsed_ms", None),
+                    "headers": interesting,
+                }
+            )
+        except Exception:  # pragma: no cover - diagnostics must be inert
+            pass
+
     def _record(
         self,
         step: Step,
@@ -106,6 +165,8 @@ class DSLExecutor:
         error: BotError | None = None,
     ) -> StepResult:
         duration = int((time.monotonic() - clock) * 1000)
+        diagnosis = getattr(error, "diagnosis", None)
+        root = getattr(diagnosis, "root_cause", None)
         result = StepResult(
             step.index,
             step.action,
@@ -116,6 +177,7 @@ class DSLExecutor:
             attempts,
             error.category.value if error else None,
             error.message if error else None,
+            root_cause=getattr(root, "value", None),
         )
         page = self._safe_page(error)
         if page is not None and self.snapshot_cb:
@@ -132,6 +194,7 @@ class DSLExecutor:
                     "attempts": attempts,
                     "error_class": error.category.value if error else None,
                     "error": error.message if error else None,
+                    "root_cause": result.root_cause,
                 }
             )
         return result
@@ -166,7 +229,12 @@ class DSLExecutor:
             except BotError as error:
                 results.append(self._record(original, StepStatus.FAILED, started_at, clock, 0, error))
                 return EngineResult(
-                    TaskStatus.FAILED, dict(self.variables), results, error.message, error.category.value
+                    TaskStatus.FAILED,
+                    dict(self.variables),
+                    results,
+                    error.message,
+                    error.category.value,
+                    diagnosis=self._diagnose(error, original, stage=STAGE_STEP),
                 )
             if dry_run and step.final:
                 results.append(self._record(step, StepStatus.SKIPPED, started_at, clock, 0))
@@ -176,11 +244,22 @@ class DSLExecutor:
             except BotError as caught:
                 attempts = int(caught.details.get("attempts", 1))
                 chosen = StepStatus.SKIPPED if step.on_error == "skip" else StepStatus.FAILED
+                diagnosis = self._diagnose(
+                    caught,
+                    step,
+                    stage=STAGE_STEP if caught.category.value == "SCRIPT" else STAGE_INTERACTION,
+                )
+                caught.diagnosis = diagnosis
                 results.append(self._record(step, chosen, started_at, clock, attempts, caught))
                 if step.on_error in {"skip", "continue"}:
                     continue
                 return EngineResult(
-                    TaskStatus.FAILED, dict(self.variables), results, caught.message, caught.category.value
+                    TaskStatus.FAILED,
+                    dict(self.variables),
+                    results,
+                    caught.message,
+                    caught.category.value,
+                    diagnosis=diagnosis,
                 )
             results.append(self._record(step, status, started_at, clock, attempts))
         receipt = self.variables.get("receipt_no")

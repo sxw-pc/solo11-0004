@@ -49,6 +49,20 @@ class EvidenceStore:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
         return path
+    def append_exchange(self, run_id: str, task_id: str, record: dict[str, Any]) -> Path:
+        """Persist one bounded request/response record for diagnostics."""
+        path = self.task_dir(run_id, task_id) / "exchanges.jsonl"
+        payload = dict(record)
+        payload.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        return path
+    def action_log_path(self, run_id: str, task_id: str) -> Path:
+        return self.task_dir(run_id, task_id) / "actions.jsonl"
+    def exchange_log_path(self, run_id: str, task_id: str) -> Path:
+        return self.task_dir(run_id, task_id) / "exchanges.jsonl"
+    def receipt_path(self, run_id: str, task_id: str) -> Path:
+        return self.task_dir(run_id, task_id) / "receipt.html"
     def cleanup(self, keep: int | None = None) -> list[str]:
         retain = self.keep_runs if keep is None else max(0, keep)
         if not self.base_dir.is_dir():

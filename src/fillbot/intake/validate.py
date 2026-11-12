@@ -168,3 +168,37 @@ def validate_raw_tasks(docs: list[dict[str, Any]]) -> list[TaskRecord]:
     return records
 def load_and_validate_tasks(path: str | Path) -> list[TaskRecord]:
     return validate_raw_tasks(load_raw_tasks(path))
+
+
+# Categories of pre-runtime validation issues, mapped onto the shared root-cause
+# taxonomy so intake failures and runtime failures report consistently.
+_VALIDATION_CATEGORIES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"duplicate", re.IGNORECASE), "duplicate"),
+    (re.compile(r"file not found|must be a path|not found", re.IGNORECASE), "attachment"),
+    (re.compile(r"attachments", re.IGNORECASE), "attachment"),
+    (re.compile(r"is required", re.IGNORECASE), "missing_required"),
+    (re.compile(r"must be|does not match|valid date|length must|must match", re.IGNORECASE), "format"),
+)
+
+
+def categorize_issue(issue: ValidationIssue) -> str:
+    """Coarse category for a single intake issue; unknown shapes fall back to ``format``."""
+    haystack = f"{issue.field} {issue.message}"
+    for pattern, category in _VALIDATION_CATEGORIES:
+        if pattern.search(haystack):
+            return category
+    return "format"
+
+
+def validation_feature_details(error: TaskValidationError) -> dict[str, Any]:
+    """Summarize intake issues for the shared diagnostics collector."""
+    from collections import Counter
+
+    issues = list(getattr(error, "issues", []) or [])
+    categories = Counter(categorize_issue(issue) for issue in issues)
+    return {
+        "source": "intake",
+        "issue_count": len(issues),
+        "categories": dict(sorted(categories.items())),
+        "fields": [issue.field for issue in issues][:50],
+    }

@@ -61,6 +61,7 @@ class StepResult:
     error_class: str | None = None
     error_message: str | None = None
     snapshot_path: str | None = None
+    root_cause: str | None = None
 @dataclass
 class EngineResult:
     status: TaskStatus
@@ -70,6 +71,7 @@ class EngineResult:
     error_class: str | None = None
     receipt_no: str | None = None
     attempts: int = 1
+    diagnosis: Any | None = None
 @dataclass
 class RunRecord:
     run_id: str
@@ -97,6 +99,12 @@ class TaskSummary:
     error_message: str | None = None
     receipt_no: str | None = None
     evidence_dir: str = ""
+    root_cause: str | None = None
+    root_cause_label: str | None = None
+    diagnosis_suggestion: str | None = None
+    evidence_path: str = ""
+    evidence_links: list[dict[str, Any]] = field(default_factory=list)
+    diagnostic_json: str = ""
 @dataclass
 class RunSummary:
     run_id: str
@@ -110,5 +118,7 @@ class RunSummary:
     receipts: list[str]
     started_at: str
     finished_at: str | None = None
+    failure_root_causes: dict[str, int] = field(default_factory=dict)
+    diagnosis_overhead_ms: float = 0.0
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -1,6 +1,7 @@
 """Command-line interface: mock-serve, validate, run, resume, report."""
 from __future__ import annotations
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -90,6 +91,24 @@ def _resume(args: argparse.Namespace, config: BotConfig) -> int:
 def _report(args: argparse.Namespace, config: BotConfig) -> int:
     print_summary(Ledger(config.ledger_path), args.run_id)
     return 0
+
+
+def _intake_diagnosis(args: argparse.Namespace, exc: TaskValidationError) -> dict[str, object] | None:
+    """Classify a pre-runtime validation error and emit one JSON diagnostic line.
+
+    Best-effort and output-only: never changes the exit code or re-raises.
+    """
+    try:
+        from fillbot.diagnostics.collector import diagnosis_from_intake
+        from fillbot.intake.validate import validation_feature_details
+
+        diagnosis = diagnosis_from_intake(exc)
+        payload = diagnosis.as_ledger_json()
+        payload["features"]["details"].update(validation_feature_details(exc))
+        payload["source_file"] = str(getattr(args, "tasks", "") or "")
+        return payload
+    except Exception:  # pragma: no cover - diagnostics must be inert
+        return None
 def _mock_serve(args: argparse.Namespace) -> int:
     if not 1 <= args.port <= 65535:
         raise BotError("--port must be between 1 and 65535")
@@ -132,6 +151,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         for issue in exc.issues:
             print(f"  {issue.render()}", file=sys.stderr)
+        diagnosis = _intake_diagnosis(args, exc)
+        if diagnosis is not None:
+            print("diagnosis: " + json.dumps(diagnosis, ensure_ascii=False, sort_keys=True), file=sys.stderr)
         return 2
     except (BotError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

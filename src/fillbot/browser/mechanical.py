@@ -206,13 +206,27 @@ class MechanicalBrowser(BrowserSession):
                 retry_after = float(response.headers["Retry-After"]) if "Retry-After" in response.headers else None
             except ValueError:
                 retry_after = None
-            raise ServerError(f"rate limited (429) at {url}", status=429, retry_after=retry_after, page=page)
+            raise ServerError(
+                f"rate limited (429) at {url}",
+                status=429,
+                retry_after=retry_after,
+                page=page,
+                details={"method": method, "request_url": url},
+            )
         if response.status_code >= 500:
-            raise ServerError(f"server error {response.status_code} at {url}", status=response.status_code, page=page)
+            raise ServerError(
+                f"server error {response.status_code} at {url}",
+                status=response.status_code,
+                page=page,
+                details={"method": method, "request_url": url},
+            )
         if response.status_code >= 400:
             snippet = selectors.normalized_text(response.text)[:160]
             raise ClientError(
-                f"client error {response.status_code} at {url}: {snippet}", status=response.status_code, page=page
+                f"client error {response.status_code} at {url}: {snippet}",
+                status=response.status_code,
+                page=page,
+                details={"method": method, "request_url": url},
             )
         return page
     def close(self) -> None:

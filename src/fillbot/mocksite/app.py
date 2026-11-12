@@ -66,6 +66,20 @@ def create_app(
         if decision.retry_after is not None:
             response.headers["Retry-After"] = str(decision.retry_after)
         return response
+    @app.before_request
+    def inject_session_faults() -> Response | None:
+        """Opt-in consequence faults used by diagnostics tests (default: off)."""
+        if chaos_controller.should_expire_session(request.method, request.path):
+            session.clear()
+            return None
+        if chaos_controller.should_fail_login() and request.path == "/login" and request.method == "POST":
+            return render_template("login.html", csrf_token=token(), error="账号或口令不正确"), 401
+        if request.method == "POST" and chaos_controller.should_break_csrf(request.path):
+            # Overwrite the CSRF field so ``csrf_ok`` rejects the submission.
+            form = request.form.copy()
+            form["csrf_token"] = "tampered-token"
+            request.form = form  # type: ignore[assignment]
+        return None
     @app.get("/")
     def index() -> Response | str:
         return redirect(url_for("login") if current_account() is None else url_for("step1"))
@@ -147,6 +161,13 @@ def create_app(
         values, errors = validate_step3(request.form, request.files.get("attachment"))
         if errors:
             return render_template("step3.html", csrf_token=token(), values=values, errors=errors), 400
+        if chaos_controller.should_reject_attachment():
+            return render_template(
+                "step3.html",
+                csrf_token=token(),
+                values=values,
+                errors={"attachment": ["附件不能超过 64 KiB"]},
+            ), 413
         data["step3"] = values
         save_report(data)
         return redirect(url_for("confirm"))
