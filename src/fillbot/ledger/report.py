@@ -1,19 +1,39 @@
 """Build and export run summaries from the ledger (no evidence dependency)."""
 from __future__ import annotations
+
 import csv
 import json
 import sys
 from collections import Counter
 from pathlib import Path
 from typing import TextIO
+
 from fillbot.errors import ScriptError
 from fillbot.ledger.db import Ledger
 from fillbot.models import RunSummary
-def build_summary(ledger: Ledger, run_id: str) -> RunSummary:
+from fillbot.security.access import AccessPolicy, Principal
+
+
+def build_summary(
+    ledger: Ledger,
+    run_id: str,
+    *,
+    principal: Principal | None = None,
+    policy: AccessPolicy | None = None,
+) -> RunSummary:
     run = ledger.get_run(run_id)
     if run is None:
         raise ScriptError(f"run not found: {run_id}")
-    tasks = ledger.list_tasks(run_id)
+    active_policy = policy or ledger.access_policy()
+    if principal is not None and active_policy.enabled():
+        # Explicit authorization for the run as a whole; a deny must surface as
+        # an error rather than silently rendering an empty report.
+        decision = active_policy.authorize(principal, "report.view", details={"run_id": run_id})
+        if not decision.allowed:
+            raise ScriptError(
+                f"report access denied for {principal.identity}: {decision.reason}"
+            )
+    tasks = ledger.guarded_list_tasks(run_id, principal, policy=active_policy)
     counts = Counter(task.status for task in tasks)
     reasons = Counter(
         task.error_class or "UNKNOWN"
@@ -34,8 +54,23 @@ def build_summary(ledger: Ledger, run_id: str) -> RunSummary:
         str(run["started_at"]),
         run["finished_at"],
     )
-def export_summary(ledger: Ledger, run_id: str, output_dir: str | Path) -> tuple[Path, Path]:
-    summary = build_summary(ledger, run_id)
+
+
+def export_summary(
+    ledger: Ledger,
+    run_id: str,
+    output_dir: str | Path,
+    *,
+    principal: Principal | None = None,
+    policy: AccessPolicy | None = None,
+) -> tuple[Path, Path]:
+    active_policy = policy or ledger.access_policy()
+    decision = active_policy.authorize(principal, "report.export", details={"run_id": run_id})
+    if not decision.allowed:
+        raise ScriptError(
+            f"report export denied for {principal.identity if principal else 'anonymous'}: {decision.reason}"
+        )
+    summary = build_summary(ledger, run_id, principal=principal, policy=active_policy)
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
     json_path, csv_path = directory / "summary.json", directory / "summary.csv"
@@ -54,8 +89,16 @@ def export_summary(ledger: Ledger, run_id: str, output_dir: str | Path) -> tuple
         writer.writerow(["metric", "value"])
         writer.writerows(rows)
     return json_path, csv_path
-def render_summary(ledger: Ledger, run_id: str) -> str:
-    summary = build_summary(ledger, run_id)
+
+
+def render_summary(
+    ledger: Ledger,
+    run_id: str,
+    *,
+    principal: Principal | None = None,
+    policy: AccessPolicy | None = None,
+) -> str:
+    summary = build_summary(ledger, run_id, principal=principal, policy=policy)
     lines = [
         f"run:      {summary.run_id}",
         f"status:   {summary.status}",
@@ -66,7 +109,7 @@ def render_summary(ledger: Ledger, run_id: str) -> str:
         f"started:  {summary.started_at}",
         f"finished: {summary.finished_at or '-'}",
     ]
-    tasks = ledger.list_tasks(run_id)
+    tasks = ledger.guarded_list_tasks(run_id, principal, policy=policy)
     if tasks:
         lines.append("task detail:")
         for task in tasks:
@@ -74,5 +117,16 @@ def render_summary(ledger: Ledger, run_id: str) -> str:
             error = f" error={task.error_class}:{task.error_message}" if task.error_class else ""
             lines.append(f"  {task.task_id} [{task.status}] {task.duration_ms}ms{suffix}{error}")
     return "\n".join(lines)
-def print_summary(ledger: Ledger, run_id: str, stream: TextIO | None = None) -> None:
-    (stream or sys.stdout).write(render_summary(ledger, run_id) + "\n")
+
+
+def print_summary(
+    ledger: Ledger,
+    run_id: str,
+    stream: TextIO | None = None,
+    *,
+    principal: Principal | None = None,
+    policy: AccessPolicy | None = None,
+) -> None:
+    (stream or sys.stdout).write(
+        render_summary(ledger, run_id, principal=principal, policy=policy) + "\n"
+    )

@@ -1,17 +1,23 @@
 """Command-line interface: mock-serve, validate, run, resume, report."""
 from __future__ import annotations
+
 import argparse
 import sys
 from pathlib import Path
 from typing import Sequence
+
 from fillbot.config import BotConfig, load_config
 from fillbot.dsl.schema import load_script
 from fillbot.errors import BotError, TaskValidationError
+from fillbot.evidence.store import EvidenceStore
 from fillbot.intake import load_and_validate_tasks
 from fillbot.ledger.db import Ledger
 from fillbot.ledger.report import print_summary
 from fillbot.mocksite.chaos import ChaosSettings
 from fillbot.runner.scheduler import Runner
+from fillbot.security.access import Principal
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fillbot", description="Compliant form-filling RPA for authorized systems only."
@@ -26,6 +32,11 @@ def _parser() -> argparse.ArgumentParser:
     mock.add_argument("--flaky-submit", action="store_true")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--config", help="YAML config file")
+    common.add_argument(
+        "--as",
+        dest="principal",
+        help="caller identity, e.g. auditor:read@C002 (identity:roles@companies)",
+    )
     validate = sub.add_parser("validate", parents=[common], help="validate tasks and script offline")
     validate.add_argument("--tasks", required=True)
     validate.add_argument("--script", required=True)
@@ -40,7 +51,31 @@ def _parser() -> argparse.ArgumentParser:
     resume.add_argument("--base-url")
     report = sub.add_parser("report", parents=[common], help="print ledger summary")
     report.add_argument("run_id")
+    evidence = sub.add_parser("evidence", parents=[common], help="read a guarded evidence file")
+    evidence.add_argument("run_id")
+    evidence.add_argument("task_id")
+    evidence.add_argument("filename")
+    access = sub.add_parser("access", help="manage role/company grants and enforcement")
+    access_sub = access.add_subparsers(dest="access_command", required=True)
+    grant = access_sub.add_parser("grant", parents=[common])
+    grant.add_argument("role")
+    grant.add_argument("company_id", help="company id or * for every company")
+    grant.add_argument("access_level", choices=("read", "admin"))
+    grant.add_argument("--note", default="")
+    revoke = access_sub.add_parser("revoke", parents=[common])
+    revoke.add_argument("role")
+    revoke.add_argument("company_id")
+    revoke.add_argument("access_level", choices=("read", "admin"))
+    enable = access_sub.add_parser("enable", parents=[common])
+    enable.add_argument("--off", action="store_true", help="switch enforcement back to open default")
+    access_sub.add_parser("list", parents=[common])
+    audit = sub.add_parser("audit", parents=[common], help="inspect the audit trail")
+    audit.add_argument("--principal")
+    audit.add_argument("--action")
+    audit.add_argument("--limit", type=int, default=50)
     return parser
+
+
 def _config(args: argparse.Namespace) -> BotConfig:
     overrides: dict[str, object] = {}
     if getattr(args, "rate_limit", None) is not None:
@@ -50,10 +85,27 @@ def _config(args: argparse.Namespace) -> BotConfig:
     if getattr(args, "base_url", None):
         overrides["base_url"] = args.base_url
     return load_config(getattr(args, "config", None), overrides=overrides)
+
+
+def _principal(args: argparse.Namespace) -> Principal | None:
+    raw = getattr(args, "principal", None)
+    try:
+        return Principal.parse(raw)
+    except ValueError as exc:
+        raise BotError(str(exc)) from exc
+
+
 def _validate(args: argparse.Namespace) -> int:
     tasks, script = load_and_validate_tasks(args.tasks), load_script(args.script)
     print(f"OK: {len(tasks)} task(s), script={script.name} steps={len(script.steps)}; no network requests were made")
+    graded = sum(1 for task in tasks if task.field_security)
+    if graded:
+        print(f"graded task sheets: {graded}/{len(tasks)} declare sensitive field levels")
+    if script.security.enabled:
+        print(f"script security block: {len(script.security.rules)} level rule(s), {len(script.security.field_levels)} field grade(s)")
     return 0
+
+
 def _run(args: argparse.Namespace, config: BotConfig) -> int:
     tasks, script = load_and_validate_tasks(args.tasks), load_script(args.script)
     runner = Runner(config)
@@ -68,6 +120,8 @@ def _run(args: argparse.Namespace, config: BotConfig) -> int:
     print_summary(runner.ledger, run.run_id)
     print(f"summary: {config.runs_dir / run.run_id / 'summary.json'}")
     return 0
+
+
 def _resume(args: argparse.Namespace, config: BotConfig) -> int:
     ledger = Ledger(config.ledger_path)
     runner = Runner(config, ledger=ledger)
@@ -87,9 +141,66 @@ def _resume(args: argparse.Namespace, config: BotConfig) -> int:
     )
     print_summary(ledger, run.run_id)
     return 0
+
+
 def _report(args: argparse.Namespace, config: BotConfig) -> int:
-    print_summary(Ledger(config.ledger_path), args.run_id)
+    ledger = Ledger(config.ledger_path)
+    print_summary(ledger, args.run_id, principal=_principal(args))
     return 0
+
+
+def _evidence(args: argparse.Namespace, config: BotConfig) -> int:
+    ledger = Ledger(config.ledger_path)
+    store = EvidenceStore(config.evidence_dir, mask_fields=config.mask_fields, keep_runs=config.evidence_keep_runs)
+    store.bind_ledger(ledger)
+    content = store.read_evidence(
+        args.run_id,
+        args.task_id,
+        args.filename,
+        _principal(args),
+        company_resolver=ledger.task_company,
+    )
+    sys.stdout.write(content)
+    if not content.endswith("\n"):
+        sys.stdout.write("\n")
+    return 0
+
+
+def _access(args: argparse.Namespace, config: BotConfig) -> int:
+    ledger = Ledger(config.ledger_path)
+    if args.access_command == "grant":
+        ledger.upsert_grant(args.role, args.company_id, args.access_level, note=args.note)
+        print(f"grant stored: {args.role}@{args.company_id} = {args.access_level}")
+    elif args.access_command == "revoke":
+        removed = ledger.revoke_grant(args.role, args.company_id, args.access_level)
+        print(f"revoked {removed} grant(s)")
+    elif args.access_command == "enable":
+        ledger.set_access_enabled(not args.off)
+        print(f"access enforcement: {'enabled (deny by default)' if not args.off else 'disabled (open default)'}")
+    elif args.access_command == "list":
+        grants = ledger.list_grants()
+        if not grants:
+            print("no grants configured; access remains open by default")
+        for grant in grants:
+            print(f"{grant['role']:16s} {grant['company_id']:8s} {grant['access_level']:6s} {grant['note']}")
+        print(f"enforcement: {'on' if ledger.access_enabled() else 'off (open default)'}")
+    return 0
+
+
+def _audit(args: argparse.Namespace, config: BotConfig) -> int:
+    ledger = Ledger(config.ledger_path)
+    rows = ledger.list_audit(principal=args.principal, action=args.action, limit=args.limit)
+    if not rows:
+        print("no audit records")
+        return 0
+    for row in rows:
+        print(
+            f"{row['at']} {row['decision']:6s} {row['action']:16s} "
+            f"{row['principal']:12s} {row['resource']} {('- ' + row['reason']) if row['reason'] else ''}"
+        )
+    return 0
+
+
 def _mock_serve(args: argparse.Namespace) -> int:
     if not 1 <= args.port <= 65535:
         raise BotError("--port must be between 1 and 65535")
@@ -112,6 +223,8 @@ def _mock_serve(args: argparse.Namespace) -> int:
     print(f"mock site: http://127.0.0.1:{args.port} (loopback only)")
     app.run(host="127.0.0.1", port=args.port, debug=False, use_reloader=False, threaded=True)
     return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -127,6 +240,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _resume(args, config)
         if args.command == "report":
             return _report(args, config)
+        if args.command == "evidence":
+            return _evidence(args, config)
+        if args.command == "access":
+            return _access(args, config)
+        if args.command == "audit":
+            return _audit(args, config)
         parser.error(f"unknown command: {args.command}")
     except TaskValidationError as exc:
         print(str(exc), file=sys.stderr)

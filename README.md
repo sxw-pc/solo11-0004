@@ -29,15 +29,17 @@ python -m fillbot report <run_id> --config configs/bot.example.yaml
 `validate` 完全离线，仅检查任务与脚本；`run` 默认串行执行。mock 账号（虚构）：`parkco-b / mock-only-beta`（C002，正常）、`parkco-c / mock-only-gamma`（C003，可注入提交故障）。
 ## 架构
 ```text
-tasks (JSON/CSV) ──> intake loader ──> validator (row + field diagnostics)
+tasks (JSON/CSV) ──> intake loader ──> validator (row + field + 安全等级 diagnostics)
                                             │
-scripts (YAML) ──> DSL schema ──> DSL engine ──> MechanicalBrowser (requests/BeautifulSoup)
+scripts (YAML) ──> DSL schema (含 security 块) ──> DSL engine ──> MechanicalBrowser
                                             │              │
                                             │              ├─ login / multi-step forms / CSRF / upload
                                             │              └─ submit / receipt extraction
                                             ├─ retry policy (backoff + jitter + Retry-After)
-                                            ├─ evidence store (HTML, actions.jsonl, receipt.html)
-                                            └─ ledger (SQLite: runs / tasks / steps) ──> summary.json / summary.csv
+                                            ├─ security: 分级脱敏策略 (L1..L4) ──> evidence store
+                                            └─ ledger (runs/tasks/steps + access_grants/audit_log)
+                                                    │              │
+                                          受控查询/报表导出   证据读取（角色×企业授权 + 审计）
 ```
 ## 目录
 ```text
@@ -45,8 +47,9 @@ src/fillbot/browser/     requests+BeautifulSoup 适配器、页面模型、脱�
 src/fillbot/dsl/         脚本 schema、动作实现、选择器、执行引擎
 src/fillbot/intake/      JSON/CSV 载入、字段规范化与聚合校验
 src/fillbot/runner/      串行调度、重试、状态机、限速、续跑
-src/fillbot/ledger/      SQLite 台账与汇总报表
-src/fillbot/evidence/    证据目录、HTML 脱敏、保留策略
+src/fillbot/ledger/      SQLite 台账、角色/企业权限映射、审计与汇总报表
+src/fillbot/evidence/    证据目录、分级 HTML 脱敏、受控读取、保留策略
+src/fillbot/security/    安全等级、分级脱敏引擎、访问策略与审计模型
 src/fillbot/mocksite/    仅回环的 Flask 虚构报送站点
 scripts/ tasks/ tests/   示例脚本、任务清单、离线测试
 ```
@@ -87,6 +90,50 @@ steps:
   - {action: fill, label: "账号", value: "{{task.username}}"}
   - {action: click, selector: "form#login-form button[type=submit]", retry: {attempts: 3, base_seconds: 0.05}}
 ```
+## 敏感证据分级脱敏与台账访问控制
+默认行为与旧版本完全一致：任务清单不声明分级、脚本不含 `security` 块时，证据仍走内置固定规则（`mask_fields` 命中的控件与已知敏感值替换为 `***`），台账保持开放读取。只有显式配置后才启用分级与权限。
+### 1. 任务清单标记字段安全等级
+在任务对象上增加可选 `field_security`（JSON 为对象；CSV 用独立列，支持 `字段=级别;...` 紧凑格式或 JSON 对象字符串），级别为 `L1`（低）到 `L4`（高）：
+```json
+{"task_id":"T-1","biz_key":"C002:2025-Q4","attachments":["a.pdf"],
+ "field_security":{"password":"L4","contact_name":"L2","contact_phone":"L3"},
+ "payload":{"password":"mock-only-beta","contact_name":"林小岚（虚构）","contact_phone":"13800001234"}}
+```
+```csv
+task_id,biz_key,field_security,payload...
+T-1,C002:2025-Q4,password=L4;contact_name=L2,...
+```
+级别非法或指向不存在的 payload 字段会在 `validate` 阶段聚合报错；旧清单不含该字段时校验结果与之前一致。
+### 2. DSL 配置各级别自定义脱敏规则
+脚本顶层可选 `security` 块：`rules` 为每个级别指定策略，`fields` 声明脚本级字段等级，`default_level` 给未显式标注的字段兜底。任务清单的字段等级优先于脚本 `fields`。
+```yaml
+security:
+  default_level: L2
+  rules:
+    L1: {strategy: partial, keep_prefix: 1}        # 保留首字符
+    L2: {strategy: partial, keep_suffix: 4}        # 保留末 4 字符
+    L3: {strategy: full, replacement: "***"}       # 整体掩码
+    L4: {strategy: redact}                          # 最高级：***REDACTED***
+  fields:
+    password: L4
+    contact_phone: L3
+```
+策略支持 `partial`（`keep_prefix`/`keep_suffix`/`mask_char`，保留区间不重叠且至少掩码 1 字符）、`full`（自定义 `replacement`）、`redact`（固定 `***REDACTED***`）、`hash`（`sha256:` 摘要）。规则结构非法在脚本加载时报错；运行时规则缺失或等级无法解析一律降级到 L4 脱敏处理，绝不输出明文。分级运行会在每个任务证据目录写入 `security_manifest.json` 记录所用规则。
+### 3. 台账角色/企业维度权限
+SQLite 在原三表外新增 `access_grants`（角色 × 企业 × read/admin）、`access_config`（开关）、`audit_log`（审计），并给 `tasks` 增加 `company_id` 列（旧库打开时自动从 `biz_key` 前缀回填）。默认 `access_enabled=0`，即开放逻辑不变；配置授权并显式启用后变为默认拒绝：
+```bash
+python -m fillbot access grant auditor C002 read --config bot.yaml   # 角色 auditor 只读 C002
+python -m fillbot access grant admin '*' admin --config bot.yaml      # 管理员覆盖所有企业
+python -m fillbot access enable --config bot.yaml                     # 启用强制（默认拒绝）
+python -m fillbot access list --config bot.yaml
+python -m fillbot access enable --off --config bot.yaml               # 回到开放默认
+```
+调用方通过 `--as 身份:角色1,角色2@企业1,企业2` 传入（如 `--as alice:auditor@C002`）。三个受控入口统一校验：
+- **台账查询** `report` / `Ledger.guarded_*`：按授权企业过滤行，无授权返回空/报错；
+- **报表导出** `export_summary`：无权限直接拒绝，不生成文件；
+- **证据读取** `fillbot evidence <run> <task> <file> --as ...`：跨企业读取抛 `EvidenceAccessDenied`，路径穿越（`..`、绝对路径）同样拒绝。
+### 4. 审计与异常降级
+每次权限判定（allow/deny/open-default）、每次证据脱敏与读取都写入 `audit_log`，可通过 `python -m fillbot audit [--principal ...] [--action ...]` 追溯；审计行只记录主体、资源、判定与原因，不含任何 payload 明文。脱敏规则缺失、权限表损坏等异常统一 fail-closed：脱敏降级 L4 脱敏处理、访问默认拒绝，审计失败也不会中断业务（事件保留在内存）。实测分级脱敏相对旧规则单次调用开销与占任务总时长比例均控制在 10% 预算内（见 `tests/test_security_e2e.py`）。
 ## 配置与环境变量
 优先级：CLI > 环境变量 > YAML > 默认值。配置文件示例见 `configs/bot.example.yaml`；未知键会报错。
 | 键 / 环境变量 | 默认 | 说明 |
@@ -112,8 +159,8 @@ steps:
 - `--dry-run` 真实执行并留存步骤证据，但遇到 `final: true` 的点击前停止，状态为 `dry_run`，不产生回执。
 - `resume <run_id>` 从台账读取原任务/脚本路径，跳过 `success|skipped`，只执行余下任务；已成功的 `biz_key` 不会重复提交。
 ## 证据与台账
-证据位于 `evidence/<run_id>/<task_id>/`：每步 `step-NN.html`（密码、token、secret 字段及已知敏感值替换为 `***`）、`actions.jsonl`（动作、定位器、结果、耗时、错误，不含填写值）、成功提交后的 `receipt.html`。证据快照会强制保存，便于审计后复核；保留策略只清理超期运行目录，不动台账。
-SQLite 三张表：`runs`（来源、状态、计数、时间）、`tasks`（任务、业务键、回执、错误、证据目录）、`steps`（步骤、动作、状态、尝试次数）。汇总写到 `runs/<run_id>/summary.json` 与 `summary.csv`，包含成功/失败/跳过数、失败原因分布、平均耗时与回执列表。
+证据位于 `evidence/<run_id>/<task_id>/`：每步 `step-NN.html`（未启用分级时，密码/token/secret 字段及已知敏感值按固定规则替换为 `***`；启用分级后按字段等级执行 partial/full/redact/hash 规则）、`actions.jsonl`（动作、定位器、结果、耗时、错误，不含填写值）、成功提交后的 `receipt.html`，分级运行额外写入 `security_manifest.json`。证据快照会强制保存，便于审计后复核；保留策略只清理超期运行目录，不动台账。受控读取统一走 `EvidenceStore.read_evidence`，按角色/企业授权并写审计。
+SQLite 在 `runs`、`tasks`（含自动回填的 `company_id`）、`steps` 三表外，新增 `access_grants`、`access_config`、`audit_log` 三张安全表；旧版本数据库打开时自动迁移，开放默认与读取行为保持不变。汇总写到 `runs/<run_id>/summary.json` 与 `summary.csv`，包含成功/失败/跳过数、失败原因分布、平均耗时与回执列表，导出时同样经过权限校验。
 ## 故障注入与 mock 站点
 `python -m fillbot mock-serve --chaos --chaos-seed 7 --chaos-rate 0.2 --delay-ms 50 --flaky-submit` 可启用确定性故障；也可用 `FILLBOT_CHAOS*` 环境变量。`--flaky-submit` 只让指定企业（默认 C003）首次提交返回 500，用于验证重试与证据。mock 站点含登录、三步填报、确认、提交、回执路由以及 `/healthz`、`/__mock/receipts` 辅助端点。
 ## 设计取舍

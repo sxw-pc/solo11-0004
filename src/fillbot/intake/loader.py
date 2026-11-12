@@ -1,18 +1,68 @@
 """Read JSON/CSV task sheets into raw, source-located mappings."""
 from __future__ import annotations
+
 import csv
 import json
 from pathlib import Path
 from typing import Any
+
 from fillbot.errors import TaskValidationError
 from fillbot.models import ValidationIssue
-_TOP_LEVEL = {"task_id", "biz_key", "attachments", "payload"}
+
+_TOP_LEVEL = {"task_id", "biz_key", "attachments", "payload", "field_security"}
+#: CSV column carrying per-field security grades for the row.
+FIELD_SECURITY_COLUMN = "field_security"
+
+
 def _issue(path: Path, row: int, field: str, message: str) -> ValidationIssue:
     return ValidationIssue(str(path), row, field, message)
+
+
 def _fail(message: str, issues: list[ValidationIssue]) -> TaskValidationError:
     return TaskValidationError(message, issues)
+
+
 def _meta(path: Path, row: int) -> dict[str, Any]:
     return {"_source_file": str(path), "_source_row": row, "_base_dir": str(path.parent)}
+
+
+def parse_field_security(raw: Any) -> dict[str, str] | None:
+    """Parse a field-security declaration.
+
+    Accepted shapes (JSON task sheets): an object ``{"password": "L4"}``.
+    Accepted shapes (CSV cells): a JSON object string, or compact
+    ``password=L4;contact_phone=L3`` pairs. Returns ``None`` when empty.
+    """
+    if raw is None or raw == "" or raw == {} or raw == []:
+        return None
+    if isinstance(raw, dict):
+        return {str(key): str(value) for key, value in raw.items()}
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        if text.startswith("{"):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"field_security is not valid JSON: {exc.msg}") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("field_security JSON must be an object")
+            return {str(key): str(value) for key, value in parsed.items()}
+        mapping: dict[str, str] = {}
+        for pair in text.replace("|", ";").split(";"):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                raise ValueError(f"field_security entry {pair!r} must use field=LEVEL")
+            name, level = pair.split("=", 1)
+            name, level = name.strip(), level.strip()
+            if not name or not level:
+                raise ValueError(f"field_security entry {pair!r} is incomplete")
+            mapping[name] = level
+        return mapping or None
+    raise ValueError("field_security must be an object or a compact field=LEVEL string")
 def _json_documents(path: Path) -> list[dict[str, Any]]:
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -67,6 +117,16 @@ def _csv_documents(path: Path) -> list[dict[str, Any]]:
                 key, value = raw_key.strip(), raw_value if raw_value is not None else ""
                 if key == "attachments":
                     doc["attachments"] = _split_attachments(value)
+                elif key == FIELD_SECURITY_COLUMN:
+                    try:
+                        parsed = parse_field_security(value)
+                    except ValueError as exc:
+                        raise _fail(
+                            f"invalid field_security at row {row_number}",
+                            [_issue(path, row_number, FIELD_SECURITY_COLUMN, str(exc))],
+                        ) from exc
+                    if parsed is not None:
+                        doc["field_security"] = parsed
                 elif key in _TOP_LEVEL:
                     doc[key] = str(value).strip()
                 else:

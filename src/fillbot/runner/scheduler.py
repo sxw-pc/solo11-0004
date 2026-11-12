@@ -19,8 +19,45 @@ from fillbot.models import RunRecord, RunStatus, TaskRecord, TaskStatus, elapsed
 from fillbot.runner.pacing import RateLimiter, new_run_id
 from fillbot.runner.retry import RetryPolicy
 from fillbot.runner.state import plan_resume
+from fillbot.security.levels import SecurityLevel
+from fillbot.security.masking import MaskingPolicy
+
 RECEIPT_RE = re.compile(r"^RCP-\d{8}-\d{4}$")
 BrowserFactory = Callable[[], BrowserSession]
+
+
+def build_masking_policy(
+    script: Script,
+    tasks: Sequence[TaskRecord],
+    mask_fields: Sequence[str],
+) -> MaskingPolicy:
+    """Merge DSL security config with per-task field grades.
+
+    Task-sheet grades take precedence over script-level field defaults.
+    With no grading anywhere the returned policy is a legacy policy, so the
+    evidence output stays identical to the pre-grading release.
+    """
+    security = script.security
+    dsl_fields = {name: level for name, level in security.field_levels.items()}
+    merged: dict[str, SecurityLevel] = dict(dsl_fields)
+    for task in tasks:
+        for name, raw_level in (task.field_security or {}).items():
+            try:
+                merged[name] = SecurityLevel.parse(raw_level)
+            except ValueError:
+                # Bad intake data should have been rejected earlier; fail closed.
+                merged[name] = SecurityLevel.L4
+    if not security.enabled and not merged:
+        return MaskingPolicy.legacy_policy(mask_fields)
+    defaults = MaskingPolicy.create(mask_fields=mask_fields).rules
+    policy = MaskingPolicy(
+        rules={**defaults, **dict(security.rules)},
+        field_levels=merged,
+        default_level=security.default_level,
+        mask_fields=tuple(mask_fields),
+        legacy=False,
+    )
+    return policy
 class Runner:
     def __init__(
         self,
@@ -37,6 +74,8 @@ class Runner:
         self.evidence = evidence or EvidenceStore(
             config.evidence_dir, mask_fields=config.mask_fields, keep_runs=config.evidence_keep_runs
         )
+        # Share the ledger authorizer/audit table with the evidence store.
+        self.evidence.bind_ledger(self.ledger)
         self.sleeper = sleeper
         self.limiter = RateLimiter(config.rate_limit_per_minute, sleeper=sleeper)
         self._browser_factory = browser_factory
@@ -70,7 +109,35 @@ class Runner:
                 handler.close()
             self._file_handler = None
     def _secrets(self, task: TaskRecord) -> list[str]:
-        return [str(value) for key, value in task.payload.items() if value and is_sensitive(key, self.config.mask_fields)]
+        """Values that must never appear verbatim in evidence.
+
+        In legacy mode only the fixed mask-field list applies (unchanged
+        behaviour). In graded mode every graded payload field is treated as a
+        secret so free-text occurrences are redacted even outside form inputs.
+        """
+        return [value for _, value in self._named_secrets(task)]
+
+    def _named_secrets(self, task: TaskRecord) -> list[tuple[str, str]]:
+        """``(field_name, value)`` pairs, enabling per-grade free-text masking."""
+        policy = self.evidence.policy
+        if policy.legacy:
+            return [
+                (key, str(value))
+                for key, value in task.payload.items()
+                if value and is_sensitive(key, self.config.mask_fields)
+            ]
+        secret_keys = set(policy.field_levels)
+        if policy.default_level is not None:
+            secret_keys.update(task.payload.keys())
+        else:
+            secret_keys.update(
+                key for key in task.payload if is_sensitive(key, self.config.mask_fields)
+            )
+        return [
+            (key, str(value))
+            for key, value in task.payload.items()
+            if value and key in secret_keys
+        ]
     def _task_context(self, task: TaskRecord) -> dict[str, object]:
         context: dict[str, object] = dict(task.payload)
         context.update({"task_id": task.task_id, "biz_key": task.biz_key, "attachments": [str(path) for path in task.attachments], "attachment": str(task.attachment) if task.attachment else ""})
@@ -82,12 +149,16 @@ class Runner:
         evidence_dir = str(self.evidence.task_dir(run_id, task.task_id))
         self.ledger.start_task(run_id, task, started_at, evidence_dir)
         logger.info("task %s started biz_key=%s", task.task_id, task.biz_key)
-        secrets, snapshots = self._secrets(task), {}
+        named_secrets = self._named_secrets(task)
+        secrets, snapshots = [value for _, value in named_secrets], {}
         browser = self._factory()
         env = {**os.environ, "FILLBOT_BASE_URL": self.config.base_url}
         def snapshot_cb(step, page, status):
             snapshots[step.index] = str(
-                self.evidence.snapshot(run_id, task.task_id, step.index, page, secret_values=secrets)
+                self.evidence.snapshot(
+                    run_id, task.task_id, step.index, page,
+                    secret_values=secrets, named_secrets=named_secrets,
+                )
             )
         def action_cb(record):
             self.evidence.append_action(run_id, task.task_id, record)
@@ -134,7 +205,10 @@ class Runner:
                 if problem:
                     status, error_class, error_message, receipt = TaskStatus.FAILED, "ASSERT", problem, None
                 else:
-                    self.evidence.save_receipt(run_id, task.task_id, browser.page, secret_values=secrets)
+                    self.evidence.save_receipt(
+                        run_id, task.task_id, browser.page,
+                        secret_values=secrets, named_secrets=named_secrets,
+                    )
             elif status == TaskStatus.DRY_RUN:
                 receipt = None
             duration = elapsed_ms(started)
@@ -220,6 +294,12 @@ class Runner:
             )
             self.ledger.create_run(run)
             logger.info("start run=%s tasks=%s dry_run=%s", rid, len(tasks), dry_run)
+        self.evidence.policy = build_masking_policy(script, tasks, self.config.mask_fields)
+        logger.info(
+            "masking mode=%s graded_fields=%d",
+            "legacy" if self.evidence.policy.legacy else "graded",
+            len(self.evidence.policy.field_levels),
+        )
         try:
             completed = set(plan_resume(self.ledger, rid, tasks).completed_task_ids) if resume else set()
             for task in tasks:

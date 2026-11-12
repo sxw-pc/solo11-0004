@@ -1,0 +1,51 @@
+[
+  {
+    "task_id": "T-2001",
+    "biz_key": "C002:2025-Q4",
+    "attachments": ["attachments/quarterly-notes.pdf"],
+    "field_security": {
+      "password": "L4",
+      "contact_phone": "L3",
+      "contact_name": "L2",
+      "company_name": "L1"
+    },
+    "payload": {
+      "username": "parkco-b",
+      "password": "mock-only-beta",
+      "company_id": "C002",
+      "company_name": "青岚谷生态科技（虚构）",
+      "period": "2025-Q4",
+      "contact_name": "林小岚（虚构）",
+      "contact_phone": "13800001234",
+      "report_date": "2025-11-10",
+      "electricity": 12800.5,
+      "water": 340.2,
+      "gas": 88.1,
+      "employees": 42,
+      "hires": 3
+    }
+  },
+  {
+    "task_id": "T-2003",
+    "biz_key": "C003:2025-Q4",
+    "attachments": ["attachments/quarterly-notes.pdf"],
+    "field_security": {
+      "password": "L4",
+      "contact_name": "L2"
+    },
+    "payload": {
+      "username": "parkco-c",
+      "password": "mock-only-gamma",
+      "company_id": "C003",
+      "company_name": "溪谷智造工坊（虚构）",
+      "period": "2025-Q4",
+      "contact_name": "顾青（虚构）",
+      "report_date": "2025-11-10",
+      "electricity": 4520.0,
+      "water": 88.0,
+      "gas": 12.5,
+      "employees": 18,
+      "hires": 1
+    }
+  }
+]

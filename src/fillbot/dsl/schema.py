@@ -7,6 +7,8 @@ from typing import Any, Mapping
 import yaml
 from fillbot.browser.base import Locator
 from fillbot.errors import ScriptError, UnregisteredActionError
+from fillbot.security.levels import SecurityLevel
+from fillbot.security.masking import MaskRule
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 @dataclass(frozen=True)
 class ActionSpec:
@@ -49,11 +51,25 @@ class Step:
     timeout: float | None = None
     final: bool = False
 @dataclass(frozen=True)
+class SecurityConfig:
+    """Optional graded-masking configuration attached to a script."""
+
+    rules: dict[SecurityLevel, MaskRule] = field(default_factory=dict)
+    field_levels: dict[str, SecurityLevel] = field(default_factory=dict)
+    default_level: SecurityLevel | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.rules) or bool(self.field_levels) or self.default_level is not None
+
+
+@dataclass(frozen=True)
 class Script:
     name: str
     version: int
     steps: tuple[Step, ...]
     description: str = ""
+    security: SecurityConfig = field(default_factory=SecurityConfig)
 def available_actions() -> list[str]:
     return sorted(ACTION_REGISTRY)
 def _locator_for(action: str, raw: dict[str, Any], step_no: int) -> Locator | None:
@@ -160,10 +176,52 @@ def _parse_step(raw: Any, step_no: int) -> Step:
         float(timeout) if timeout is not None else None,
         final,
     )
+def _parse_security(raw: Any) -> SecurityConfig:
+    """Parse the optional top-level ``security`` block of a YAML script."""
+    if raw is None:
+        return SecurityConfig()
+    if not isinstance(raw, Mapping):
+        raise ScriptError("script.security must be a mapping")
+    unknown = set(raw) - {"rules", "fields", "default_level"}
+    if unknown:
+        raise ScriptError(f"security: unknown key(s): {', '.join(sorted(unknown))}")
+
+    rules: dict[SecurityLevel, MaskRule] = {}
+    raw_rules = raw.get("rules", {})
+    if not isinstance(raw_rules, Mapping):
+        raise ScriptError("security.rules must be a mapping of L1..L4 to mask rules")
+    for raw_level, raw_rule in raw_rules.items():
+        try:
+            level = SecurityLevel.parse(raw_level)
+        except ValueError as exc:
+            raise ScriptError(f"security.rules: {exc}") from exc
+        rules[level] = MaskRule.from_dict(raw_rule)
+
+    field_levels: dict[str, SecurityLevel] = {}
+    raw_fields = raw.get("fields", {})
+    if not isinstance(raw_fields, Mapping):
+        raise ScriptError("security.fields must be a mapping of field name to level")
+    for name, raw_level in raw_fields.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ScriptError("security.fields keys must be non-empty strings")
+        try:
+            field_levels[name.strip()] = SecurityLevel.parse(raw_level)
+        except ValueError as exc:
+            raise ScriptError(f"security.fields.{name}: {exc}") from exc
+
+    default_level: SecurityLevel | None = None
+    if "default_level" in raw and raw["default_level"] is not None:
+        try:
+            default_level = SecurityLevel.parse(raw["default_level"])
+        except ValueError as exc:
+            raise ScriptError(f"security.default_level: {exc}") from exc
+    return SecurityConfig(rules, field_levels, default_level)
+
+
 def validate_script(data: Mapping[str, Any]) -> Script:
     if not isinstance(data, Mapping):
         raise ScriptError("script must be a YAML mapping")
-    unknown = set(data) - {"name", "version", "steps", "description"}
+    unknown = set(data) - {"name", "version", "steps", "description", "security"}
     if unknown:
         raise ScriptError(f"unknown top-level key(s): {', '.join(sorted(unknown))}")
     name = data.get("name")
@@ -175,7 +233,7 @@ def validate_script(data: Mapping[str, Any]) -> Script:
     if not isinstance(raw_steps, list) or not raw_steps:
         raise ScriptError("script.steps must be a non-empty list")
     steps = tuple(_parse_step(item, index) for index, item in enumerate(raw_steps, 1))
-    return Script(name.strip(), 1, steps, str(data.get("description", "")))
+    return Script(name.strip(), 1, steps, str(data.get("description", "")), _parse_security(data.get("security")))
 def load_script(path: str | Path) -> Script:
     script_path = Path(path)
     if not script_path.is_file():

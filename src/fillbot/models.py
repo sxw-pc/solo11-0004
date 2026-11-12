@@ -36,9 +36,18 @@ class TaskRecord:
     attachments: tuple[Path, ...] = ()
     source_row: int = 0
     source_file: str = ""
+    #: Optional payload-field -> security grade mapping (e.g. {"password": "L4"}).
+    #: Absent/empty means the task predates grading and keeps legacy behaviour.
+    field_security: dict[str, str] = field(default_factory=dict)
+
     @property
     def attachment(self) -> Path | None:
         return self.attachments[0] if self.attachments else None
+
+    @property
+    def company_id(self) -> str:
+        """Owning company, used for role/company-scoped ledger access."""
+        return str(self.payload.get("company_id", ""))
 @dataclass
 class ValidationIssue:
     source_file: str

@@ -8,6 +8,7 @@ from typing import Any
 from fillbot.errors import TaskValidationError
 from fillbot.intake.loader import load_raw_tasks
 from fillbot.models import TaskRecord, ValidationIssue
+from fillbot.security.levels import SecurityLevel
 TASK_ID_RE = re.compile(r"^T-[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
 BIZ_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$")
 PERIOD_RE = re.compile(r"^\d{4}-Q[1-4]$")
@@ -137,6 +138,36 @@ def _key_issue(
         return text, [ValidationIssue(source, row, field, f"duplicate {field} (first seen at row {seen[text]})")]
     seen[text] = row
     return text, []
+def _field_security(
+    doc: dict[str, Any], source: str, row: int, known_fields: set[str]
+) -> tuple[dict[str, str], list[ValidationIssue]]:
+    """Validate the optional per-task sensitive-field grading declaration."""
+    raw = doc.get("field_security")
+    if raw is None:
+        return {}, []
+    if not isinstance(raw, dict):
+        return {}, [ValidationIssue(source, row, "field_security", "must be an object of field=LEVEL")]
+    issues: list[ValidationIssue] = []
+    resolved: dict[str, str] = {}
+    for name, raw_level in raw.items():
+        field_name = f"field_security.{name}"
+        if not isinstance(name, str) or not name.strip():
+            issues.append(ValidationIssue(source, row, "field_security", "field names must be non-empty strings"))
+            continue
+        try:
+            level = SecurityLevel.parse(raw_level)
+        except ValueError as exc:
+            issues.append(ValidationIssue(source, row, field_name, str(exc)))
+            continue
+        if name not in known_fields:
+            issues.append(
+                ValidationIssue(source, row, field_name, f"unknown payload field {name!r}; no grading applied")
+            )
+            continue
+        resolved[name] = level.label
+    return resolved, issues
+
+
 def validate_raw_tasks(docs: list[dict[str, Any]]) -> list[TaskRecord]:
     issues: list[ValidationIssue] = []
     records: list[TaskRecord] = []
@@ -161,8 +192,20 @@ def validate_raw_tasks(docs: list[dict[str, Any]]) -> list[TaskRecord]:
                 normalized_payload[name] = normalized
         attachments, attachment_issues = _attachments(doc, source, row)
         issues.extend(attachment_issues)
+        field_security, security_issues = _field_security(doc, source, row, set(PAYLOAD_SCHEMA))
+        issues.extend(security_issues)
         if task_id and biz_key:
-            records.append(TaskRecord(task_id, biz_key, normalized_payload, tuple(attachments), row, source))
+            records.append(
+                TaskRecord(
+                    task_id,
+                    biz_key,
+                    normalized_payload,
+                    tuple(attachments),
+                    row,
+                    source,
+                    dict(field_security),
+                )
+            )
     if issues:
         raise TaskValidationError(f"{len(issues)} task validation error(s) across {len(docs)} row(s)", issues)
     return records
