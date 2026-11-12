@@ -1,4 +1,7 @@
 # fillbot engine configuration (examples only; no secrets belong here).
+# Precedence: CLI > environment > this file > defaults. Unknown top-level keys
+# are rejected, but invalid *site policy entries* are ignored so a running
+# batch always falls back to the global policy instead of aborting.
 base_url: http://127.0.0.1:5000
 timeout_seconds: 10
 follow_redirects: true
@@ -7,6 +10,23 @@ backoff_base_seconds: 0.4
 backoff_max_seconds: 8.0
 jitter: true
 rate_limit_per_minute: 60
+
+# Per-target-site policies. The key is a host, a host:port, a URL or a
+# wildcard (*.example.com). Only the listed fields override the global values
+# above; everything else is inherited. Loopback examples only.
+site_policies:
+  "127.0.0.1:5000":
+    rate_limit_per_minute: 120
+    timeout_seconds: 5
+    max_retries: 3
+    backoff_base_seconds: 0.2
+    backoff_max_seconds: 4
+  "*.mock.example":          # wildcard example; inactive unless such a host exists
+    rate_limit_per_minute: 30
+
+# Consecutive successful responses needed before a throttled site speeds back up.
+site_policy_recovery_streak: 3
+
 evidence_keep_runs: 10
 evidence_dir: evidence
 ledger_path: data/ledger.db

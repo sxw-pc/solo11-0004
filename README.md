@@ -64,7 +64,7 @@ T-9002,C002:2025-Q1,attachments/quarterly-notes.pdf,C002,2025-Q1
 ```
 校验失败会一次性聚合所有问题，输出 `文件:row N [field] message`，便于逐行修正。
 ## DSL 参考
-顶层字段：`name`（必填）、`version: 1`、`steps`（非空列表）。每个步骤是映射，支持 `selector` 或 `label` 二选一作为定位器；公共选项：`timeout`（秒，>0）、`retry`（整数或 `{attempts, base_seconds, max_seconds}`）、`on_error`（`fail|skip|continue`）、`final`（仅 `click` 可用，标记提交步骤）。
+顶层字段：`name`（必填）、`version: 1`、`steps`（非空列表）。每个步骤是映射，支持 `selector` 或 `label` 二选一作为定位器；公共选项：`timeout`（秒，>0）、`retry`（整数或 `{attempts, base_seconds, max_seconds}`）、`policy`（本步骤的站点策略覆盖，字段同 `site_policies`）、`on_error`（`fail|skip|continue`）、`final`（仅 `click` 可用，标记提交步骤）。
 | 动作 | 参数 | 说明 |
 | --- | --- | --- |
 | `open` | `url` | 打开 URL；`timeout` 可覆盖 |
@@ -98,12 +98,27 @@ steps:
 | `backoff_max_seconds` / `..._MAX_SECONDS` | 8.0 | 退避上限 |
 | `jitter` / `FILLBOT_JITTER` | true | 是否加抖动 |
 | `rate_limit_per_minute` / `..._RATE_LIMIT_PER_MINUTE` | 60 | 全局令牌桶速率 |
+| `site_policies` / `FILLBOT_SITE_POLICIES` | `{}` | 按站点域名（可含端口/通配符）的独立策略，见下文 |
+| `site_policy_recovery_streak` / `FILLBOT_SITE_POLICY_RECOVERY_STREAK` | 3 | 触发限流后连续多少次成功响应才逐步提速 |
 | `follow_redirects` / `FILLBOT_FOLLOW_REDIRECTS` | true | 是否跟随重定向 |
 | `evidence_dir` / `FILLBOT_EVIDENCE_DIR` | `evidence` | 证据根目录 |
 | `evidence_keep_runs` / `FILLBOT_EVIDENCE_KEEP_RUNS` | 10 | 保留最近运行数 |
 | `ledger_path` / `FILLBOT_LEDGER_PATH` | `data/ledger.db` | SQLite 台账路径 |
 | `runs_dir` / `FILLBOT_RUNS_DIR` | `runs` | run.log 与汇总目录 |
 | `mask_fields` | password/passwd/secret/token/csrf_token | 证据脱敏字段 |
+## 多站点限速与动态降速
+默认所有目标共用 `rate_limit_per_minute` 与 `timeout_seconds`。可为不同授权站点单独配置策略；键支持 `host`、`host:port`、完整 URL 或通配符（如 `*.example.com`），未显式给出的字段继承全局配置。示例见 `configs/bot.example.yaml`：
+```yaml
+site_policies:
+  "reports.example.com": {rate_limit_per_minute: 20, timeout_seconds: 30, max_retries: 4, backoff_base_seconds: 0.5, backoff_max_seconds: 20}
+  "127.0.0.1:5000": {rate_limit_per_minute: 120}
+```
+- **站点解析**按请求 URL 的真实 `host:port` 进行；策略只影响对应站点，其余站点仍按全局值运行。
+- **步骤级覆盖**：DSL 步骤可加 `policy`（字段同上，仅对本步骤生效，不改变配置）。非法覆盖会被忽略并写入审计事件，不会被误用。
+- **动态降速**：站点返回 `429`（或带 `Retry-After` 的 `503`）时，立即将该站点的令牌速率减半并清空桶内令牌；连续 `site_policy_recovery_streak` 次成功响应后按 1.25 倍逐步恢复，直至原始速率。未触发限流的站点不产生任何额外等待或时钟开销。
+- **审计**：每次 `limit_triggered`、`policy_adjusted`（步骤覆盖/限流降速/成功恢复/断点恢复）都会写入 `steps.policy_events_json`，可用 `Ledger.list_step_events(run_id)` 读取；证据与报表结构不变。
+- **兼容与容错**：旧配置文件（无 `site_policies`）与旧 DSL 脚本照常运行；非法站点键/策略字段会被丢弃并回退到全局配置，只输出告警（`validate`/`run`/`resume` 与 `run.log`），绝不中断运行中的批次。旧台账会在首次打开时以增量方式补充 `policy_events_json` 列，历史数据保持可读。
+- **断点续跑**：`resume` 会从台账重放已记录的站点降速状态，继续沿用限速节奏，并追加一条 `resume_restore` 事件。
 ## 错误、重试与状态
 错误类别：`NETWORK`、`SERVER`（均含 429/5xx）、`CLIENT`（4xx）、`ASSERT`、`SCRIPT`。只有 NETWORK/SERVER 自动重试；`Retry-After` 优先，其次指数退避 + 抖动。任务状态：`pending → running → success|failed|skipped|dry_run`；运行状态：`running → success|failed|interrupted|dry_run`，`interrupted/failed` 可续跑。未捕获异常（含 Ctrl+C/SystemExit）会把运行标记为 `interrupted` 后继续抛出。
 ## 幂等、dry-run 与续跑
@@ -113,7 +128,7 @@ steps:
 - `resume <run_id>` 从台账读取原任务/脚本路径，跳过 `success|skipped`，只执行余下任务；已成功的 `biz_key` 不会重复提交。
 ## 证据与台账
 证据位于 `evidence/<run_id>/<task_id>/`：每步 `step-NN.html`（密码、token、secret 字段及已知敏感值替换为 `***`）、`actions.jsonl`（动作、定位器、结果、耗时、错误，不含填写值）、成功提交后的 `receipt.html`。证据快照会强制保存，便于审计后复核；保留策略只清理超期运行目录，不动台账。
-SQLite 三张表：`runs`（来源、状态、计数、时间）、`tasks`（任务、业务键、回执、错误、证据目录）、`steps`（步骤、动作、状态、尝试次数）。汇总写到 `runs/<run_id>/summary.json` 与 `summary.csv`，包含成功/失败/跳过数、失败原因分布、平均耗时与回执列表。
+SQLite 三张表：`runs`（来源、状态、计数、时间）、`tasks`（任务、业务键、回执、错误、证据目录）、`steps`（步骤、动作、状态、尝试次数、`policy_events_json` 限流/策略事件）。汇总写到 `runs/<run_id>/summary.json` 与 `summary.csv`，包含成功/失败/跳过数、失败原因分布、平均耗时与回执列表。
 ## 故障注入与 mock 站点
 `python -m fillbot mock-serve --chaos --chaos-seed 7 --chaos-rate 0.2 --delay-ms 50 --flaky-submit` 可启用确定性故障；也可用 `FILLBOT_CHAOS*` 环境变量。`--flaky-submit` 只让指定企业（默认 C003）首次提交返回 500，用于验证重试与证据。mock 站点含登录、三步填报、确认、提交、回执路由以及 `/healthz`、`/__mock/receipts` 辅助端点。
 ## 设计取舍

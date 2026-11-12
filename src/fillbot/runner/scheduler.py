@@ -16,9 +16,10 @@ from fillbot.evidence.store import EvidenceStore, is_sensitive
 from fillbot.ledger.db import Ledger
 from fillbot.ledger.report import export_summary
 from fillbot.models import RunRecord, RunStatus, TaskRecord, TaskStatus, elapsed_ms, iso_now, utcnow
-from fillbot.runner.pacing import RateLimiter, new_run_id
+from fillbot.runner.pacing import new_run_id
 from fillbot.runner.retry import RetryPolicy
 from fillbot.runner.state import plan_resume
+from fillbot.sites import RequestGovernor, SitePolicyRegistry
 RECEIPT_RE = re.compile(r"^RCP-\d{8}-\d{4}$")
 BrowserFactory = Callable[[], BrowserSession]
 class Runner:
@@ -38,14 +39,36 @@ class Runner:
             config.evidence_dir, mask_fields=config.mask_fields, keep_runs=config.evidence_keep_runs
         )
         self.sleeper = sleeper
-        self.limiter = RateLimiter(config.rate_limit_per_minute, sleeper=sleeper)
+        self.site_registry = SitePolicyRegistry(config)
+        self.governor = RequestGovernor(
+            self.site_registry,
+            sleeper=sleeper,
+            recovery_streak=getattr(config, "site_policy_recovery_streak", 3),
+        )
         self._browser_factory = browser_factory
         self._logger = logger
         self._file_handler: logging.FileHandler | None = None
+        self._warn_site_policies()
+
+    @property
+    def limiter(self) -> RequestGovernor:
+        """Backwards-compatible handle to the pacing object."""
+        return self.governor
+
+    def _warn_site_policies(self) -> None:
+        for warning in self.site_registry.warnings:
+            if self._logger is not None:
+                self._logger.warning(warning)
+
     def _factory(self) -> BrowserSession:
         if self._browser_factory is not None:
             return self._browser_factory()
-        return MechanicalBrowser(timeout=self.config.timeout_seconds, follow_redirects=self.config.follow_redirects, limiter=self.limiter.wait)
+        return MechanicalBrowser(
+            timeout=self.config.timeout_seconds,
+            follow_redirects=self.config.follow_redirects,
+            request_hook=self.governor.before_request,
+            response_hook=self.governor.note_response,
+        )
     def _setup_logging(self, run_id: str) -> logging.Logger:
         run_dir = self.config.runs_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -82,8 +105,9 @@ class Runner:
         evidence_dir = str(self.evidence.task_dir(run_id, task.task_id))
         self.ledger.start_task(run_id, task, started_at, evidence_dir)
         logger.info("task %s started biz_key=%s", task.task_id, task.biz_key)
+        for warning in self.site_registry.warnings:
+            logger.warning(warning)
         secrets, snapshots = self._secrets(task), {}
-        browser = self._factory()
         env = {**os.environ, "FILLBOT_BASE_URL": self.config.base_url}
         def snapshot_cb(step, page, status):
             snapshots[step.index] = str(
@@ -101,6 +125,7 @@ class Runner:
                 delay,
                 error.category.value,
             )
+        browser = self._factory()
         try:
             executor = DSLExecutor(
                 script,
@@ -113,6 +138,7 @@ class Runner:
                 action_log_cb=action_cb,
                 retry_cb=retry_cb,
                 sleeper=self.sleeper,
+                governor=self.governor,
             )
             result = executor.execute(dry_run=dry_run)
             for step in result.steps:
@@ -207,6 +233,7 @@ class Runner:
                 options=options or {},
             )
             logger.info("resume run=%s remaining planned=%s", rid, len(tasks))
+            self.governor.restore_from_ledger(self.ledger, rid)
         else:
             run = RunRecord(
                 rid,

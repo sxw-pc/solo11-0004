@@ -32,9 +32,12 @@ class MechanicalBrowser(BrowserSession):
         timeout: float = 10.0,
         follow_redirects: bool = True,
         limiter: Callable[[], None] | None = None,
+        request_hook: Callable[[str], float | None] | None = None,
+        response_hook: Callable[[str, int, float | None], None] | None = None,
         session: requests.Session | None = None,
     ) -> None:
         self.timeout, self.follow_redirects, self._limiter = timeout, follow_redirects, limiter
+        self._request_hook, self._response_hook = request_hook, response_hook
         self._session = session or requests.Session()
         self._session.trust_env = False
         self._session.headers.setdefault("User-Agent", "fillbot/0.1 (loopback mock only)")
@@ -176,9 +179,15 @@ class MechanicalBrowser(BrowserSession):
         timeout: float | None,
         follow_redirects: bool | None,
     ) -> Page:
-        if self._limiter:
+        hook_timeout: float | None = None
+        if self._request_hook is not None:
+            # The pacing hook runs *before* the timeout is resolved so a
+            # site/step policy can supply the effective timeout.
+            hook_timeout = self._request_hook(url)
+        elif self._limiter:
             self._limiter()
-        started, effective_timeout = time.monotonic(), timeout if timeout is not None else self.timeout
+        started = time.monotonic()
+        effective_timeout = timeout if timeout is not None else (hook_timeout if hook_timeout is not None else self.timeout)
         try:
             response = self._session.request(
                 method,
@@ -201,12 +210,18 @@ class MechanicalBrowser(BrowserSession):
             int((time.monotonic() - started) * 1000),
         )
         self._page = page
-        if response.status_code == 429:
+        retry_after: float | None = None
+        if "Retry-After" in response.headers:
             try:
-                retry_after = float(response.headers["Retry-After"]) if "Retry-After" in response.headers else None
+                retry_after = float(response.headers["Retry-After"])
             except ValueError:
                 retry_after = None
+        if response.status_code == 429:
+            if self._response_hook is not None:
+                self._response_hook(url, 429, retry_after)
             raise ServerError(f"rate limited (429) at {url}", status=429, retry_after=retry_after, page=page)
+        if self._response_hook is not None:
+            self._response_hook(url, response.status_code, retry_after)
         if response.status_code >= 500:
             raise ServerError(f"server error {response.status_code} at {url}", status=response.status_code, page=page)
         if response.status_code >= 400:

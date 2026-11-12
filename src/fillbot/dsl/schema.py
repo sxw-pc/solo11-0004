@@ -30,7 +30,7 @@ ACTION_REGISTRY = {
     "extract": ActionSpec(frozenset({"save_as"}), frozenset({"attr"}), locator=True),
     "set_var": ActionSpec(frozenset({"name", "value"})),
 }
-COMMON_KEYS = frozenset({"on_error", "retry", "timeout", "final"})
+COMMON_KEYS = frozenset({"on_error", "retry", "timeout", "final", "policy"})
 ON_ERROR_VALUES = frozenset({"fail", "skip", "continue"})
 @dataclass(frozen=True)
 class RetrySpec:
@@ -48,6 +48,9 @@ class Step:
     retry_explicit: bool = False
     timeout: float | None = None
     final: bool = False
+    policy: dict[str, Any] | None = None
+    policy_issues: tuple[str, ...] = ()
+    timeout_explicit: bool = True
 @dataclass(frozen=True)
 class Script:
     name: str
@@ -118,6 +121,17 @@ def _check_param_types(action: str, params: dict[str, Any], step_no: int) -> Non
         fail("attr must be a non-empty string")
 def _valid_identifier(value: Any) -> bool:
     return isinstance(value, str) and bool(_IDENTIFIER.fullmatch(value))
+def _parse_step_policy(raw: Any, step_no: int) -> tuple[dict[str, Any] | None, tuple[str, ...]]:
+    """Parse an optional step-level policy; invalid config is reported, not fatal."""
+    if raw is None:
+        return None, ()
+    from fillbot.sites import parse_policy
+
+    override, issues = parse_policy(raw)
+    if override is None or issues:
+        return None, tuple(issues or ["invalid policy"])
+    return override.as_dict(), ()
+
 def _parse_step(raw: Any, step_no: int) -> Step:
     if not isinstance(raw, dict):
         raise ScriptError(f"step {step_no}: must be a mapping")
@@ -144,6 +158,12 @@ def _parse_step(raw: Any, step_no: int) -> Step:
     timeout = raw.get("timeout")
     if timeout is not None and (not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0):
         raise ScriptError(f"step {step_no}: timeout must be > 0")
+    policy, policy_issues = _parse_step_policy(raw.get("policy"), step_no)
+    policy_timeout = policy.get("timeout_seconds") if policy else None
+    if timeout is None and policy_timeout is not None:
+        # A step-level policy timeout takes effect even without an explicit
+        # step `timeout`; it is still capped by the same > 0 rule.
+        timeout = policy_timeout
     final = raw.get("final", False)
     if not isinstance(final, bool):
         raise ScriptError(f"step {step_no}: final must be a boolean")
@@ -159,6 +179,9 @@ def _parse_step(raw: Any, step_no: int) -> Step:
         "retry" in raw,
         float(timeout) if timeout is not None else None,
         final,
+        policy,
+        policy_issues,
+        raw.get("timeout") is not None,
     )
 def validate_script(data: Mapping[str, Any]) -> Script:
     if not isinstance(data, Mapping):

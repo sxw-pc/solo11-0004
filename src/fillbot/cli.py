@@ -50,12 +50,22 @@ def _config(args: argparse.Namespace) -> BotConfig:
     if getattr(args, "base_url", None):
         overrides["base_url"] = args.base_url
     return load_config(getattr(args, "config", None), overrides=overrides)
+def _policy_warnings(config: BotConfig) -> int:
+    for warning in config.site_policy_warnings:
+        print(f"WARNING: {warning}", file=sys.stderr)
+    return len(config.site_policy_warnings)
 def _validate(args: argparse.Namespace) -> int:
+    config = _config(args)
     tasks, script = load_and_validate_tasks(args.tasks), load_script(args.script)
-    print(f"OK: {len(tasks)} task(s), script={script.name} steps={len(script.steps)}; no network requests were made")
+    _policy_warnings(config)
+    print(
+        f"OK: {len(tasks)} task(s), script={script.name} steps={len(script.steps)}, "
+        f"site_policies={len(config.site_policies)}; no network requests were made"
+    )
     return 0
 def _run(args: argparse.Namespace, config: BotConfig) -> int:
     tasks, script = load_and_validate_tasks(args.tasks), load_script(args.script)
+    _policy_warnings(config)
     runner = Runner(config)
     run = runner.run(
         tasks,
@@ -63,7 +73,10 @@ def _run(args: argparse.Namespace, config: BotConfig) -> int:
         task_source=str(Path(args.tasks).resolve()),
         script_source=str(Path(args.script).resolve()),
         dry_run=args.dry_run,
-        options={"rate_limit_per_minute": config.rate_limit_per_minute},
+        options={
+            "rate_limit_per_minute": config.rate_limit_per_minute,
+            "site_policies": sorted(config.site_policies),
+        },
     )
     print_summary(runner.ledger, run.run_id)
     print(f"summary: {config.runs_dir / run.run_id / 'summary.json'}")
@@ -77,6 +90,7 @@ def _resume(args: argparse.Namespace, config: BotConfig) -> int:
     task_source, script_source = str(row["task_source"] or ""), str(row["script_source"] or "")
     if not task_source or not script_source:
         raise BotError("run is missing its original tasks/script paths")
+    _policy_warnings(config)
     run = runner.resume(
         args.run_id,
         load_and_validate_tasks(task_source),

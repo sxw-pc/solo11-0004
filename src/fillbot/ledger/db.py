@@ -23,14 +23,14 @@ CREATE TABLE IF NOT EXISTS steps (
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, task_id TEXT NOT NULL, step_index INTEGER NOT NULL,
   action TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT, finished_at TEXT,
   duration_ms INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, error_class TEXT,
-  error_message TEXT, snapshot_path TEXT, UNIQUE(run_id, task_id, step_index),
+  error_message TEXT, snapshot_path TEXT, policy_events_json TEXT, UNIQUE(run_id, task_id, step_index),
   FOREIGN KEY(run_id) REFERENCES runs(run_id));
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_receipt_unique ON tasks(receipt_no)
   WHERE receipt_no IS NOT NULL AND receipt_no <> '';
 CREATE INDEX IF NOT EXISTS idx_tasks_biz_key ON tasks(biz_key, status);
 """
 _TASK_COLUMNS = "run_id, task_id, biz_key, status, started_at, finished_at, duration_ms, attempts, error_class, error_message, receipt_no, evidence_dir"
-_STEP_COLUMNS = "run_id, task_id, step_index, action, status, started_at, finished_at, duration_ms, attempts, error_class, error_message, snapshot_path"
+_STEP_COLUMNS = "run_id, task_id, step_index, action, status, started_at, finished_at, duration_ms, attempts, error_class, error_message, snapshot_path, policy_events_json"
 class Ledger:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -59,6 +59,13 @@ class Ledger:
     def initialize(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            self._migrate(connection)
+
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        """Additive, non-destructive upgrade for ledgers created by older versions."""
+        columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(steps)")}
+        if "policy_events_json" not in columns:
+            connection.execute("ALTER TABLE steps ADD COLUMN policy_events_json TEXT")
     def create_run(self, run: RunRecord) -> None:
         self._write(
             "INSERT INTO runs (run_id, started_at, finished_at, status, tasks_total, succeeded, failed, skipped, task_source, script_source, dry_run, base_url, evidence_dir, options_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -145,10 +152,11 @@ class Ledger:
         )
     def record_step(self, run_id: str, task_id: str, step: StepResult) -> None:
         self._write(
-            f"INSERT INTO steps ({_STEP_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            f"INSERT INTO steps ({_STEP_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(run_id, task_id, step_index) DO UPDATE SET action = excluded.action, status = excluded.status, "
             "started_at = excluded.started_at, finished_at = excluded.finished_at, duration_ms = excluded.duration_ms, "
-            "attempts = excluded.attempts, error_class = excluded.error_class, error_message = excluded.error_message, snapshot_path = excluded.snapshot_path",
+            "attempts = excluded.attempts, error_class = excluded.error_class, error_message = excluded.error_message, "
+            "snapshot_path = excluded.snapshot_path, policy_events_json = excluded.policy_events_json",
             (
                 run_id,
                 task_id,
@@ -162,8 +170,39 @@ class Ledger:
                 step.error_class,
                 step.error_message,
                 step.snapshot_path,
+                json.dumps(step.policy_events, ensure_ascii=False, sort_keys=True) if step.policy_events else None,
             ),
         )
+
+    def list_step_events(self, run_id: str, task_id: str | None = None) -> list[dict[str, Any]]:
+        """Return policy events decoded from persisted steps, in write order.
+
+        Ordering follows SQLite insertion order (``rowid``) so replaying a
+        resumed run applies the *latest* throttle state per site, regardless of
+        alphabetical task ids.
+        """
+        sql, params = "SELECT task_id, step_index, policy_events_json FROM steps WHERE run_id = ?", [run_id]
+        if task_id is not None:
+            sql, params = sql + " AND task_id = ?", params + [task_id]
+        rows = self._fetch(sql + " ORDER BY rowid ASC", tuple(params))
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            raw = row["policy_events_json"]
+            if not raw:
+                continue
+            try:
+                decoded = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(decoded, list):
+                continue
+            for event in decoded:
+                if isinstance(event, dict):
+                    record = dict(event)
+                    record.setdefault("task_id", str(row["task_id"]))
+                    record.setdefault("step", int(row["step_index"]))
+                    events.append(record)
+        return events
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         row = self._fetch("SELECT * FROM runs WHERE run_id = ?", (run_id,), one=True)
         return dict(row) if row else None

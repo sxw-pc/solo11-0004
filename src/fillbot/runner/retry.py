@@ -18,11 +18,12 @@ class RetryPolicy:
     def __post_init__(self) -> None:
         if self.max_attempts < 1 or self.base_seconds < 0 or self.max_seconds < self.base_seconds:
             raise ValueError("invalid retry policy")
-    def compute_delay(self, attempt: int, error: BotError | None = None) -> float:
+    def compute_delay(self, attempt: int, error: BotError | None = None, *, jitter: bool | None = None) -> float:
         if error is not None and error.retry_after is not None:
             return max(0.0, float(error.retry_after))
         raw = min(self.base_seconds * (2 ** max(0, attempt - 1)), self.max_seconds)
-        if self.jitter and raw > 0:
+        use_jitter = self.jitter if jitter is None else jitter
+        if use_jitter and raw > 0:
             raw *= self.rng.uniform(0.75, 1.25)
         return max(0.0, min(raw, self.max_seconds))
 @dataclass
@@ -34,6 +35,7 @@ def run_with_retry(
     policy: RetryPolicy,
     *,
     on_retry: Callable[[int, BotError, float], None] | None = None,
+    delay_for: Callable[[int, BotError], float] | None = None,
 ) -> RetryOutcome:
     for attempt in range(1, policy.max_attempts + 1):
         try:
@@ -41,7 +43,7 @@ def run_with_retry(
         except BotError as error:
             if not error.retryable or attempt >= policy.max_attempts:
                 raise
-            delay = policy.compute_delay(attempt, error)
+            delay = delay_for(attempt, error) if delay_for is not None else policy.compute_delay(attempt, error)
             if on_retry:
                 on_retry(attempt, error, delay)
             if delay > 0:

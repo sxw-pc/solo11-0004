@@ -1,5 +1,6 @@
 """Configuration precedence: CLI > environment > YAML file > defaults."""
 from __future__ import annotations
+import json
 import os
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -20,6 +21,8 @@ _DEFAULTS: dict[str, Any] = {
     "ledger_path": "data/ledger.db",
     "runs_dir": "runs",
     "mask_fields": ["password", "passwd", "secret", "token", "csrf_token"],
+    "site_policies": {},
+    "site_policy_recovery_streak": 3,
 }
 _ENV_MAP = {
     "FILLBOT_BASE_URL": "base_url",
@@ -34,6 +37,8 @@ _ENV_MAP = {
     "FILLBOT_EVIDENCE_DIR": "evidence_dir",
     "FILLBOT_LEDGER_PATH": "ledger_path",
     "FILLBOT_RUNS_DIR": "runs_dir",
+    "FILLBOT_SITE_POLICIES": "site_policies",
+    "FILLBOT_SITE_POLICY_RECOVERY_STREAK": "site_policy_recovery_streak",
 }
 def _bool(value: Any, name: str) -> bool:
     if isinstance(value, bool):
@@ -54,6 +59,40 @@ def _num(value: Any, name: str, cast: type, minimum: float) -> float | int:
     if parsed < minimum:
         raise ConfigError(f"{name} must be >= {minimum:g}")
     return parsed
+def _site_policies_and_warnings(value: Any) -> tuple[dict[str, Any], list[str]]:
+    """Lenient per-site policy parsing with a diagnostic per ignored entry.
+
+    Invalid configuration never raises: the entry is dropped so the target site
+    silently keeps the global policy, which is exactly the documented fallback.
+    """
+    warnings: list[str] = []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}, warnings
+        try:
+            value = json.loads(text)
+        except (TypeError, ValueError):
+            return {}, ["site_policies ignored: not valid JSON"]
+    if not isinstance(value, Mapping):
+        return {}, ["site_policies ignored: must be a mapping"]
+    from fillbot.sites import canonical_site, parse_policy
+
+    cleaned: dict[str, Any] = {}
+    for raw_key, raw_policy in value.items():
+        key = canonical_site(raw_key)
+        if key is None:
+            warnings.append(f"site policy {raw_key!r} ignored: invalid site key; using global policy")
+            continue
+        override, issues = parse_policy(raw_policy)
+        if override is None or issues:
+            warnings.append(
+                f"site policy {raw_key!r} ignored: {'; '.join(issues) or 'invalid policy'}; using global policy"
+            )
+            continue
+        cleaned[key] = override.as_dict()
+    return cleaned, warnings
+
 def _coerce(key: str, value: Any) -> Any:
     if key in {"timeout_seconds", "backoff_base_seconds", "backoff_max_seconds"}:
         return _num(value, key, float, 0.01)
@@ -69,6 +108,10 @@ def _coerce(key: str, value: Any) -> Any:
         if not isinstance(value, (list, tuple)) or not all(isinstance(item, str) for item in value):
             raise ConfigError("mask_fields must be a list of strings")
         return list(value)
+    if key == "site_policies":
+        return value
+    if key == "site_policy_recovery_streak":
+        return _num(value, key, int, 1)
     if key == "base_url":
         text = str(value).strip().rstrip("/")
         if not text.startswith(("http://", "https://")):
@@ -90,6 +133,10 @@ class BotConfig:
     ledger_path: Path = field(default_factory=lambda: Path("data/ledger.db"))
     runs_dir: Path = field(default_factory=lambda: Path("runs"))
     mask_fields: tuple[str, ...] = ("password", "passwd", "secret", "token", "csrf_token")
+    site_policies: dict[str, Any] = field(default_factory=dict)
+    site_policy_recovery_streak: int = 3
+    site_policy_warnings: tuple[str, ...] = ()
+
     def with_overrides(self, **overrides: Any) -> "BotConfig":
         clean = {key: value for key, value in overrides.items() if value is not None}
         return replace(self, **clean) if clean else self
@@ -101,6 +148,8 @@ class BotConfig:
         for key in ("evidence_dir", "ledger_path", "runs_dir"):
             data[key] = str(data[key])
         data["mask_fields"] = list(self.mask_fields)
+        data["site_policies"] = {key: dict(value) for key, value in self.site_policies.items()}
+        data["site_policy_warnings"] = list(self.site_policy_warnings)
         return data
 def load_config(
     path: str | Path | None = None,
@@ -137,4 +186,7 @@ def load_config(
     merged["mask_fields"] = tuple(merged["mask_fields"])
     if merged["backoff_base_seconds"] > merged["backoff_max_seconds"]:
         raise ConfigError("backoff_base_seconds cannot exceed backoff_max_seconds")
+    site_policies, warnings = _site_policies_and_warnings(merged.get("site_policies"))
+    merged["site_policies"] = site_policies
+    merged["site_policy_warnings"] = tuple(warnings)
     return BotConfig(**merged)

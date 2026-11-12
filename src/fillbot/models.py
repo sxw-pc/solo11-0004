@@ -61,6 +61,7 @@ class StepResult:
     error_class: str | None = None
     error_message: str | None = None
     snapshot_path: str | None = None
+    policy_events: list[dict[str, Any]] = field(default_factory=list)
 @dataclass
 class EngineResult:
     status: TaskStatus
